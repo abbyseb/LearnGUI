@@ -19,6 +19,15 @@ test/
 Runs/
 *_Run_*
 *.log
-
-*.asv
-*.autosave
+# Large Binaries and Data
+*.mha
+*.mhd
+*.mat
+*.exe
+*.dll
+*.pyd
+*.lib
+*.raw
+*.bin
+*.nii
+*.nii.gz

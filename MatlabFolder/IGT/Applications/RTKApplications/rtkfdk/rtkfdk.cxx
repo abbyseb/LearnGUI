@@ -1,0 +1,292 @@
+/*=========================================================================
+ *
+ *  Copyright RTK Consortium
+ *
+ *  Licensed under the Apache License, Version 2.0 (the "License");
+ *  you may not use this file except in compliance with the License.
+ *  You may obtain a copy of the License at
+ *
+ *         http://www.apache.org/licenses/LICENSE-2.0.txt
+ *
+ *  Unless required by applicable law or agreed to in writing, software
+ *  distributed under the License is distributed on an "AS IS" BASIS,
+ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *  See the License for the specific language governing permissions and
+ *  limitations under the License.
+ *
+ *=========================================================================*/
+
+#include "rtkfdk_ggo.h"
+#include "rtkGgoFunctions.h"
+#include "igtConfiguration.h"
+
+#include "rtkThreeDCircularProjectionGeometryXMLFile.h"
+#include "rtkDisplacedDetectorImageFilter.h"
+#include "rtkParkerShortScanImageFilter.h"
+#include "rtkFDKConeBeamReconstructionFilter.h"
+#ifdef IGT_USE_CUDA
+#  include "rtkCudaDisplacedDetectorImageFilter.h"
+#  include "rtkCudaParkerShortScanImageFilter.h"
+#  include "rtkCudaFDKConeBeamReconstructionFilter.h"
+#endif
+#ifdef IGT_USE_OPENCL
+#  include "rtkOpenCLFDKConeBeamReconstructionFilter.h"
+#endif
+#include "rtkFDKWarpBackProjectionImageFilter.h"
+#include "rtkCyclicDeformationImageFilter.h"
+#include "rtkThreeDCircularProjectionGeometrySorter.h"
+#include "rtkBinNumberReader.h"
+
+#include <itkStreamingImageFilter.h>
+#include <itkImageFileWriter.h>
+
+int main(int argc, char * argv[])
+{
+  GGO(rtkfdk, args_info);
+
+  typedef float OutputPixelType;
+  const unsigned int Dimension = 3;
+
+  typedef itk::Image< OutputPixelType, Dimension >     CPUOutputImageType;
+#ifdef IGT_USE_CUDA
+  typedef itk::CudaImage< OutputPixelType, Dimension > OutputImageType;
+#else
+  typedef CPUOutputImageType                           OutputImageType;
+#endif
+
+  // Read in bin number vector if csv file provided
+  typedef rtk::BinNumberReader BinNumberReaderType;
+  BinNumberReaderType::Pointer binReader = BinNumberReaderType::New();
+  if(args_info.sortfile_given)
+  {
+	binReader->SetFileName( args_info.sortfile_arg );
+	binReader->Parse();
+  }
+
+  // Projections reader
+  typedef rtk::ProjectionsReader< OutputImageType > ReaderType;
+  ReaderType::Pointer reader = ReaderType::New();
+  if(args_info.sortfile_given)
+	rtk::SetProjectionsReaderFromGgo<ReaderType, args_info_rtkfdk>(reader, args_info, binReader->GetOutput() );
+  else
+	rtk::SetProjectionsReaderFromGgo<ReaderType, args_info_rtkfdk>(reader, args_info);
+
+  itk::TimeProbe readerProbe;
+  if(!args_info.lowmem_flag)
+    {
+    if(args_info.verbose_flag)
+      std::cout << "Reading... " << std::flush;
+    readerProbe.Start();
+    TRY_AND_EXIT_ON_ITK_EXCEPTION( reader->Update() )
+    readerProbe.Stop();
+    if(args_info.verbose_flag)
+      std::cout << "It took " << readerProbe.GetMean() << ' ' << readerProbe.GetUnit() << std::endl;
+    }
+
+  // Geometry
+  if(args_info.verbose_flag)
+    std::cout << "Reading geometry information from "
+              << args_info.geometry_arg
+              << "..."
+              << std::endl;
+  rtk::ThreeDCircularProjectionGeometryXMLFileReader::Pointer geometryReader;
+  geometryReader = rtk::ThreeDCircularProjectionGeometryXMLFileReader::New();
+  geometryReader->SetFilename(args_info.geometry_arg);
+  TRY_AND_EXIT_ON_ITK_EXCEPTION( geometryReader->GenerateOutputInformation() );
+
+  // Geometry pointer type
+  rtk::ThreeDCircularProjectionGeometrySorter::GeometryPointer geometryPointer;
+  if(args_info.sortfile_given)
+  {
+	  rtk::ThreeDCircularProjectionGeometrySorter::Pointer geometrySorter = rtk::ThreeDCircularProjectionGeometrySorter::New();
+	  geometrySorter->SetInputGeometry( geometryReader->GetOutputObject() );
+	  geometrySorter->SetBinNumberVector( binReader->GetOutput() );
+	  geometrySorter->Sort();
+	  geometryPointer = geometrySorter->GetOutput()[args_info.binnumber_arg - 1];
+  }
+  else
+  {
+	  geometryPointer = geometryReader->GetOutputObject();
+  }
+
+  // Check on hardware parameter
+#ifndef IGT_USE_CUDA
+  if(!strcmp(args_info.hardware_arg, "cuda") )
+    {
+    std::cerr << "The program has not been compiled with cuda option" << std::endl;
+    return EXIT_FAILURE;
+    }
+#endif
+#ifndef IGT_USE_OPENCL
+   if(!strcmp(args_info.hardware_arg, "opencl") )
+     {
+     std::cerr << "The program has not been compiled with opencl option" << std::endl;
+     return EXIT_FAILURE;
+    }
+#endif
+
+  // Displaced detector weighting
+  typedef rtk::DisplacedDetectorImageFilter< OutputImageType > DDFCPUType;
+#ifdef IGT_USE_CUDA
+  typedef rtk::CudaDisplacedDetectorImageFilter DDFType;
+#else
+  typedef rtk::DisplacedDetectorImageFilter< OutputImageType > DDFType;
+#endif
+  DDFCPUType::Pointer ddf;
+  if(!strcmp(args_info.hardware_arg, "cuda")) 
+    {
+	if(args_info.dd_given)
+	  {
+	  if(!strcmp(args_info.dd_arg, "cuda"))
+		ddf = DDFType::New();
+	  else
+	    ddf = DDFCPUType::New();
+	  }
+	else
+	  ddf = DDFType::New();
+	}
+  else
+    {
+	if(args_info.dd_given)
+	  {
+	  if(!strcmp(args_info.dd_arg, "cuda"))
+		ddf = DDFType::New();
+	  else
+	    ddf = DDFCPUType::New();
+	  }
+	else
+	  ddf = DDFCPUType::New();
+	}
+  ddf->SetInput( reader->GetOutput() );
+  ddf->SetGeometry( geometryPointer );
+
+  // Short scan image filter
+  typedef rtk::ParkerShortScanImageFilter< OutputImageType > PSSFCPUType;
+#ifdef IGT_USE_CUDA
+  typedef rtk::CudaParkerShortScanImageFilter PSSFType;
+#else
+  typedef rtk::ParkerShortScanImageFilter< OutputImageType > PSSFType;
+#endif
+  PSSFCPUType::Pointer pssf;
+  if(!strcmp(args_info.hardware_arg, "cuda") )
+    pssf = PSSFType::New();
+  else
+    pssf = PSSFCPUType::New();
+  pssf->SetInput( ddf->GetOutput() );
+  pssf->SetGeometry( geometryPointer );
+  pssf->InPlaceOff();
+
+  // Create reconstructed image
+  typedef rtk::ConstantImageSource< OutputImageType > ConstantImageSourceType;
+  ConstantImageSourceType::Pointer constantImageSource = ConstantImageSourceType::New();
+  rtk::SetConstantImageSourceFromGgo<ConstantImageSourceType, args_info_rtkfdk>(constantImageSource, args_info);
+
+  // Motion-compensated objects for the compensation of a cyclic deformation.
+  // Although these will only be used if the command line options for motion
+  // compensation are set, we still create the object before hand to avoid auto
+  // destruction.
+  typedef itk::Vector<float,3> DVFPixelType;
+  typedef itk::Image< DVFPixelType, 3 > DVFImageType;
+  typedef rtk::CyclicDeformationImageFilter< DVFImageType > DeformationType;
+  typedef itk::ImageFileReader<DeformationType::InputImageType> DVFReaderType;
+  DVFReaderType::Pointer dvfReader = DVFReaderType::New();
+  DeformationType::Pointer def = DeformationType::New();
+  def->SetInput(dvfReader->GetOutput());
+  typedef rtk::FDKWarpBackProjectionImageFilter<OutputImageType, OutputImageType, DeformationType> WarpBPType;
+  WarpBPType::Pointer bp = WarpBPType::New();
+  bp->SetDeformation(def);
+  bp->SetGeometry( &(*(geometryPointer)) );
+
+  // This macro sets options for fdk filter which I can not see how to do better
+  // because TFFTPrecision is not the same, e.g. for CPU and CUDA (SR)
+#define SET_FELDKAMP_OPTIONS(f) \
+    f->SetInput( 0, constantImageSource->GetOutput() ); \
+    f->SetInput( 1, pssf->GetOutput() ); \
+    f->SetGeometry( geometryPointer ); \
+    f->GetRampFilter()->SetTruncationCorrection(args_info.pad_arg); \
+    f->GetRampFilter()->SetHannCutFrequency(args_info.hann_arg); \
+    f->GetRampFilter()->SetHannCutFrequencyY(args_info.hannY_arg); \
+    f->SetProjectionSubsetSize(args_info.subsetsize_arg)
+
+  // FDK reconstruction filtering
+  typedef rtk::FDKConeBeamReconstructionFilter< OutputImageType > FDKCPUType;
+  FDKCPUType::Pointer feldkamp;
+#ifdef IGT_USE_OPENCL
+  typedef rtk::OpenCLFDKConeBeamReconstructionFilter FDKOPENCLType;
+  FDKOPENCLType::Pointer feldkampOCL;
+#endif
+#ifdef IGT_USE_CUDA
+  typedef rtk::CudaFDKConeBeamReconstructionFilter FDKCUDAType;
+  FDKCUDAType::Pointer feldkampCUDA;
+#endif
+  itk::Image< OutputPixelType, Dimension > *pfeldkamp = NULL;
+  if(!strcmp(args_info.hardware_arg, "cpu") )
+    {
+    feldkamp = FDKCPUType::New();
+    SET_FELDKAMP_OPTIONS( feldkamp );
+
+    // Motion compensated CBCT settings
+    if(args_info.signal_given && args_info.dvf_given)
+      {
+      dvfReader->SetFileName(args_info.dvf_arg);
+      def->SetSignalFilename(args_info.signal_arg);
+      feldkamp->SetBackProjectionFilter( bp.GetPointer() );
+      }
+    pfeldkamp = feldkamp->GetOutput();
+    }
+#ifdef IGT_USE_CUDA
+  else if(!strcmp(args_info.hardware_arg, "cuda") )
+    {
+    feldkampCUDA = FDKCUDAType::New();
+    SET_FELDKAMP_OPTIONS( feldkampCUDA );
+    pfeldkamp = feldkampCUDA->GetOutput();
+    }
+#endif
+#ifdef IGT_USE_OPENCL
+  else if(!strcmp(args_info.hardware_arg, "opencl") )
+    {
+    feldkampOCL = FDKOPENCLType::New();
+    SET_FELDKAMP_OPTIONS( feldkampOCL );
+    pfeldkamp = feldkampOCL->GetOutput();
+    }
+#endif
+
+
+  // Streaming depending on streaming capability of writer
+  typedef itk::StreamingImageFilter<CPUOutputImageType, CPUOutputImageType> StreamerType;
+  StreamerType::Pointer streamerBP = StreamerType::New();
+  streamerBP->SetInput( pfeldkamp );
+  streamerBP->SetNumberOfStreamDivisions( args_info.divisions_arg );
+
+  // Write
+  typedef itk::ImageFileWriter<CPUOutputImageType> WriterType;
+  WriterType::Pointer writer = WriterType::New();
+  writer->SetFileName( args_info.output_arg );
+  writer->SetInput( streamerBP->GetOutput() );
+
+  if(args_info.verbose_flag)
+    std::cout << "Reconstructing and writing... " << std::flush;
+  itk::TimeProbe writerProbe;
+
+  writerProbe.Start();
+  TRY_AND_EXIT_ON_ITK_EXCEPTION( writer->Update() );
+  writerProbe.Stop();
+
+  if(args_info.verbose_flag)
+    {
+    std::cout << "It took " << writerProbe.GetMean() << ' ' << readerProbe.GetUnit() << std::endl;
+    if(!strcmp(args_info.hardware_arg, "cpu") )
+      feldkamp->PrintTiming(std::cout);
+#ifdef IGT_USE_CUDA
+    else if(!strcmp(args_info.hardware_arg, "cuda") )
+      feldkampCUDA->PrintTiming(std::cout);
+#endif
+#ifdef IGT_USE_OPENCL
+    else if(!strcmp(args_info.hardware_arg, "opencl") )
+      feldkampOCL->PrintTiming(std::cout);
+#endif
+    std::cout << std::endl;
+    }
+
+  return EXIT_SUCCESS;
+}

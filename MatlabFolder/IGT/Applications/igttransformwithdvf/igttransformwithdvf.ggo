@@ -1,0 +1,10 @@
+package "igt"
+version "Transform an input image based on an input DVF."
+
+option "config"     - "Config file"                                                 string                       no
+option "verbose"    v "Verbose execution"                                           flag                         off
+option "output"     o "Output filename of the transformed image"            		string                       yes
+option "input"      i "The input image to be transformed"							string						 yes
+option "dvf"        d "The DVF file used for the transformation"					string						 yes
+option "neg"		n "Transform using the inverted DVF"							flag						 off
+option "bin"		b "The bin index if the input DVF is 4D (starts from 1)"		int							 no

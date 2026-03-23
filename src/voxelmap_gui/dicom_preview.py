@@ -1,0 +1,442 @@
+# dicom_preview.py
+"""
+Efficient DICOM preview engine for the COPY step.
+
+Design principles:
+- Incremental file discovery (no full rescans)
+- Lazy slice reading with caching
+- Steady-rate frame emission via queue
+- Incremental volume building for MPR views
+"""
+from __future__ import annotations
+from pathlib import Path
+from typing import Optional, Dict, List, TYPE_CHECKING
+from collections import deque, defaultdict
+import numpy as np
+import time
+
+from PyQt6.QtCore import QObject, QTimer, pyqtSignal
+from PyQt6.QtGui import QPixmap, QImage
+
+if TYPE_CHECKING:
+    from pydicom.dataset import Dataset
+
+try:
+    import pydicom
+    from pydicom.misc import is_dicom
+except ImportError:
+    pydicom = None
+    def is_dicom(_): return False
+
+
+# ============================================================================
+# WINDOWING UTILITIES
+# ============================================================================
+
+def _window_to_u8(arr: np.ndarray, wl: float, ww: float) -> np.ndarray:
+    """Apply window/level and convert to uint8."""
+    lo, hi = wl - ww / 2.0, wl + ww / 2.0
+    clipped = np.clip(arr, lo, hi)
+    scaled = ((clipped - lo) / max(hi - lo, 1e-6)) * 255.0
+    return scaled.astype(np.uint8)
+
+
+def _auto_window(arr: np.ndarray) -> tuple[float, float]:
+    """Calculate window/level from percentiles."""
+    finite = arr[np.isfinite(arr)]
+    if finite.size < 10:
+        return float(np.nanmedian(arr)), max(float(np.ptp(arr)), 1.0)
+    p5, p95 = np.percentile(finite, [5, 95])
+    return (p5 + p95) / 2.0, max(p95 - p5, 1.0)
+
+
+def _array_to_pixmap(u8: np.ndarray) -> QPixmap:
+    """Convert uint8 2D array to QPixmap."""
+    if u8.ndim != 2:
+        return QPixmap()
+    u8 = np.ascontiguousarray(u8)
+    h, w = u8.shape
+    qimg = QImage(u8.data, w, h, w, QImage.Format.Format_Grayscale8)
+    return QPixmap.fromImage(qimg.copy())
+
+
+# ============================================================================
+# DICOM SLICE READER
+# ============================================================================
+
+class DicomSlice:
+    """Cached DICOM slice with lazy pixel loading."""
+    
+    __slots__ = ('path', 'instance_number', 'rows', 'cols', 
+                 'pixel_spacing', 'slice_thickness', '_pixels', 'last_access',
+                 'series_uid')
+    
+    def __init__(self, path: Path, ds: Dataset):
+        self.path = path
+        # Fallback to path name for sort stability if InstanceNumber is missing
+        self.instance_number = int(getattr(ds, 'InstanceNumber', 0) or 0)
+        self.rows = int(getattr(ds, 'Rows', 0) or 0)
+        self.cols = int(getattr(ds, 'Columns', 0) or 0)
+        
+        # Series Grouping
+        self.series_uid = str(getattr(ds, "SeriesInstanceUID", "Unknown"))
+        
+        ps = getattr(ds, 'PixelSpacing', None)
+        self.pixel_spacing = (float(ps[0]), float(ps[1])) if ps and len(ps) >= 2 else None
+        self.slice_thickness = float(getattr(ds, 'SliceThickness', 0) or 0)
+        
+        self._pixels: Optional[np.ndarray] = None
+        self.last_access = 0.0
+    
+    def get_pixels(self) -> np.ndarray:
+        """Load pixel data on demand (cached after first load)."""
+        self.last_access = time.time()
+        if self._pixels is None:
+            if pydicom is None:
+                return np.zeros((self.rows, self.cols), dtype=np.float32)
+
+            ds = pydicom.dcmread(str(self.path), force=True)
+            arr = ds.pixel_array.astype(np.float32)
+            slope = float(getattr(ds, 'RescaleSlope', 1.0) or 1.0)
+            intercept = float(getattr(ds, 'RescaleIntercept', 0.0) or 0.0)
+            self._pixels = arr * slope + intercept
+        return self._pixels
+    
+    def clear_cache(self):
+        """Release pixel memory."""
+        self._pixels = None
+    
+    @property
+    def is_loaded(self) -> bool:
+        return self._pixels is not None
+
+
+# ============================================================================
+# DICOM PREVIEW ENGINE
+# ============================================================================
+
+class DICOMPreviewEngine(QObject):
+    """
+    Efficient DICOM preview with:
+    - Incremental file discovery
+    - Smooth carousel playback (sorted by InstanceNumber)
+    - Automatic Series Detection (only shows the largest series)
+    - Time-budgeted header parsing
+    """
+    
+    # Signals
+    frame_ready = pyqtSignal(object, object, object, dict)  # ax, co, sa pixmaps + info
+    discovery_update = pyqtSignal(int)  # total files found
+    
+    # Default CT window
+    DEFAULT_WL, DEFAULT_WW = -600.0, 1500.0
+    
+    def __init__(self, train_dir: Path, 
+                 display_fps: int = 15,
+                 discovery_interval_ms: int = 200,
+                 enable_mpr: bool = False,
+                 parent=None):
+        super().__init__(parent)
+        
+        self.train_dir = Path(train_dir)
+        self.display_fps = max(1, display_fps)
+        self.discovery_interval_ms = max(50, discovery_interval_ms)
+        self.enable_mpr = enable_mpr
+        self._max_cached_slices = 50  # Limit memory usage
+        
+        # File tracking
+        self._known_paths: set[Path] = set()
+        self._processing_queue: deque[Path] = deque() 
+        self._slices: Dict[Path, DicomSlice] = {}
+        
+        # Series grouping
+        self._series_map: Dict[str, List[DicomSlice]] = defaultdict(list)
+        self._active_uid: Optional[str] = None
+        
+        # Sorting
+        self._sorted_slices: List[DicomSlice] = []
+        self._sorted_valid = True
+        
+        # Volume for MPR
+        self._volume: Optional[np.ndarray] = None
+        self._volume_valid = False
+        self._last_volume_count = 0
+        
+        # Display state
+        self._display_index = 0
+        self._wl, self._ww = self.DEFAULT_WL, self.DEFAULT_WW
+        self._auto_windowed = False
+        
+        # Timers
+        self._discovery_timer = QTimer(self)
+        self._discovery_timer.timeout.connect(self._discover_files)
+        
+        self._display_timer = QTimer(self)
+        self._display_timer.timeout.connect(self._emit_next_frame)
+        
+        self._is_running = False
+    
+    def start(self):
+        """Start discovery and display."""
+        if self._is_running:
+            return
+        self._is_running = True
+        
+        # Initial discovery
+        self._discover_files()
+        
+        # Start timers
+        self._discovery_timer.start(self.discovery_interval_ms)
+        self._display_timer.start(1000 // self.display_fps)
+    
+    def stop(self):
+        """Stop all activity."""
+        self._is_running = False
+        self._discovery_timer.stop()
+        self._display_timer.stop()
+        
+        # Clear caches to free memory
+        for sl in self._slices.values():
+            sl.clear_cache()
+        self._slices.clear()
+        self._volume = None
+    
+    # ========================================================================
+    # FILE DISCOVERY (lightweight)
+    # ========================================================================
+    
+    def _discover_files(self):
+        """Find new DICOM files without reading headers."""
+        if not self.train_dir.exists():
+            return
+        
+        # Fast glob for common DICOM extensions
+        new_files = []
+        for pattern in ("*.dcm", "*.DCM", "*.dicom", "*.ima", "*.IMA"):
+            for p in self.train_dir.rglob(pattern):
+                if p not in self._known_paths and p.is_file():
+                    new_files.append(p)
+        
+        # Also check extensionless files
+        for p in self.train_dir.rglob("*"):
+            if p.suffix == "" and p not in self._known_paths and p.is_file():
+                try:
+                    with open(p, 'rb') as f:
+                        f.seek(128)
+                        if f.read(4) == b'DICM':
+                            new_files.append(p)
+                except Exception:
+                    pass
+        
+        if new_files:
+            self._known_paths.update(new_files)
+            # Add to processing queue
+            self._processing_queue.extend(sorted(new_files))
+            self.discovery_update.emit(len(self._known_paths))
+    
+    # ========================================================================
+    # SLICE MANAGEMENT
+    # ========================================================================
+    
+    def _ensure_slice(self, path: Path) -> Optional[DicomSlice]:
+        """Get or create DicomSlice (reads header only)."""
+        if path in self._slices:
+            return self._slices[path]
+        
+        if pydicom is None:
+            return None
+
+        try:
+            ds = pydicom.dcmread(str(path), stop_before_pixels=True, force=True)
+            
+            # Verify it's CT
+            modality = str(getattr(ds, 'Modality', '')).upper()
+            if modality != 'CT':
+                return None
+            
+            sl = DicomSlice(path, ds)
+            self._slices[path] = sl
+            
+            # Add to series bucket
+            self._series_map[sl.series_uid].append(sl)
+            
+            # Determine active series (largest)
+            if self._active_uid is None:
+                self._active_uid = sl.series_uid
+            else:
+                # If this new slice belongs to a series that is now larger than the active one, switch.
+                current_len = len(self._series_map[self._active_uid])
+                new_len = len(self._series_map[sl.series_uid])
+                if new_len > current_len:
+                    self._active_uid = sl.series_uid
+            
+            self._sorted_valid = False # Mark sort as dirty
+            
+            # Memory management
+            self._cleanup_old_caches()
+            
+            return sl
+            
+        except Exception:
+            return None
+    
+    def _cleanup_old_caches(self):
+        """Clear pixel caches from least recently accessed slices."""
+        loaded = [s for s in self._slices.values() if s.is_loaded]
+        if len(loaded) <= self._max_cached_slices:
+            return
+        
+        # Sort by last access, clear oldest
+        loaded.sort(key=lambda s: s.last_access)
+        to_clear = len(loaded) - self._max_cached_slices
+        for sl in loaded[:to_clear]:
+            sl.clear_cache()
+    
+    def _get_sorted_slices(self) -> List[DicomSlice]:
+        """Get slices sorted by instance number for the ACTIVE series only."""
+        if not self._sorted_valid:
+            if self._active_uid and self._active_uid in self._series_map:
+                # Only grab slices from the active (largest) series
+                active_group = self._series_map[self._active_uid]
+                self._sorted_slices = sorted(
+                    active_group, 
+                    key=lambda s: (s.instance_number, s.path.name)
+                )
+            else:
+                self._sorted_slices = []
+                
+            self._sorted_valid = True
+            self._volume_valid = False # Invalidate MPR volume when list changes
+            
+        return self._sorted_slices
+    
+    # ========================================================================
+    # VOLUME BUILDING (incremental)
+    # ========================================================================
+    
+    def _rebuild_volume_if_needed(self) -> bool:
+        """Rebuild volume only if new slices added. Returns True if valid."""
+        slices = self._get_sorted_slices()
+        
+        if len(slices) < 3:
+            return False
+        
+        # Only rebuild if slice count changed significantly
+        if self._volume_valid and len(slices) == self._last_volume_count:
+            return True
+        
+        # Check if we have enough new slices to justify rebuild
+        if self._volume is not None:
+            new_count = len(slices) - self._last_volume_count
+            if new_count < 5 and new_count < len(slices) * 0.1:
+                return self._volume is not None
+        
+        try:
+            # Stack all slices
+            arrays = []
+            for sl in slices:
+                arr = sl.get_pixels()
+                if arr is not None:
+                    arrays.append(arr)
+            
+            if len(arrays) >= 3:
+                self._volume = np.stack(arrays, axis=0)
+                self._volume_valid = True
+                self._last_volume_count = len(slices)
+                
+                if not self._auto_windowed:
+                    self._wl, self._ww = _auto_window(self._volume)
+                    self._auto_windowed = True
+                
+                return True
+                
+        except Exception:
+            pass
+        
+        return False
+    
+    # ========================================================================
+    # FRAME EMISSION
+    # ========================================================================
+    
+    def _emit_next_frame(self):
+        """Emit next frame from SORTED list (Smooth Carousel)."""
+        if not self._is_running:
+            return
+        
+        # 1. Ingest Phase: Process headers from the queue
+        start_time = time.time()
+        TIME_BUDGET = 0.05
+        
+        while self._processing_queue:
+            if time.time() - start_time > TIME_BUDGET:
+                break 
+            path = self._processing_queue.popleft()
+            self._ensure_slice(path)
+        
+        # 2. Sort Phase: Get the ordered playlist for the ACTIVE series
+        slices = self._get_sorted_slices()
+        if not slices:
+            return
+            
+        # 3. Display Phase: Increment carousel index
+        self._display_index = (self._display_index + 1) % len(slices)
+        sl = slices[self._display_index]
+        
+        # 4. Render Phase
+        try:
+            pixels = sl.get_pixels()
+            if pixels is None:
+                return
+            
+            if not self._auto_windowed:
+                self._wl, self._ww = _auto_window(pixels)
+                self._auto_windowed = True
+            
+            ax_u8 = _window_to_u8(pixels, self._wl, self._ww)
+            ax_pm = _array_to_pixmap(ax_u8)
+            
+            # MPR (Optional)
+            co_pm, sa_pm = None, None
+            if self.enable_mpr and self._rebuild_volume_if_needed() and self._volume is not None:
+                z, y, x = self._volume.shape
+                try:
+                    idx = self._sorted_slices.index(sl)
+                except ValueError:
+                    idx = z // 2
+                
+                co_slice = self._volume[:, y // 2, :]
+                co_u8 = _window_to_u8(co_slice, self._wl, self._ww)
+                co_pm = _array_to_pixmap(co_u8)
+                
+                sa_slice = self._volume[:, :, x // 2]
+                sa_u8 = _window_to_u8(sa_slice, self._wl, self._ww)
+                sa_pm = _array_to_pixmap(sa_u8)
+            
+            # Info
+            info = {
+                'source': f"DICOM: {sl.path.name}",
+                'dims': f"{len(slices)} × {sl.rows} × {sl.cols}",
+                'vox': (f"{sl.slice_thickness:.3f}, {sl.pixel_spacing[0]:.3f}, {sl.pixel_spacing[1]:.3f}"
+                        if sl.pixel_spacing else "—"),
+                'count': str(len(slices)),
+            }
+            
+            self.frame_ready.emit(ax_pm, co_pm, sa_pm, info)
+            
+        except Exception as e:
+            print(f"Frame emission error: {e}")
+    
+    # ========================================================================
+    # PUBLIC INTERFACE
+    # ========================================================================
+    
+    def set_window(self, wl: float, ww: float):
+        self._wl, self._ww = wl, ww
+        self._auto_windowed = True
+    
+    def get_slice_count(self) -> int:
+        return len(self._known_paths)
+    
+    def get_loaded_count(self) -> int:
+        return len(self._slices)

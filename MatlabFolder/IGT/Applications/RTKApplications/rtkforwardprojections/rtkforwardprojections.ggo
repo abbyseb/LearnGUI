@@ -1,0 +1,21 @@
+package "rtk"
+version "Projects a volume according to a geometry file."
+
+option "verbose"   v "Verbose execution"                                         flag     off
+option "config"    - "Config file"                                               string   no
+option "geometry"  g  "XML geometry file name"                                   string   yes
+option "input"     i "Input volume file name"                                    string   yes
+option "output"    o "Output projections file name"                              string   yes
+option "step"      s "Step size along ray (for CudaRayCast only)"                double   no   default="1"
+option "lowmem"    l "Compute only one projection at a time"                     flag     off
+option "sortfile"  - "The csv file path used for sorting or selecting a subset of projections"	string		  no
+option "binnumber" b "The bin number of the reconstructed image if projection sorting is used"  int	no	default="1"
+
+section "Projectors"
+option "fp"    f "Forward projection method" values="Joseph","RayCastInterpolator","CudaRayCast" enum no default="Joseph"
+
+section "Projections parameters"
+option "origin"    - "Origin (default=centered)" double multiple no
+option "dimension" - "Dimension"                 int    multiple no  default="256"
+option "spacing"   - "Spacing"                   double multiple no  default="1"
+option "direction" - "Direction"                 double multiple no

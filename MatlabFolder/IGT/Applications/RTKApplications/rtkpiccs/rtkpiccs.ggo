@@ -1,0 +1,44 @@
+package "piccs"
+version "Reconstruct a 3D volume from a sequence of projections with the Prior Image Constraint Compressed Sensing method (PICCS)."
+
+option "verbose"     v "Verbose execution"                                     flag   off
+option "config"      - "Config file"                                           string no
+option "thread"		 - "Maximum number of threads. Setting this to lower numbers can prevent crashes when using CPU modules sometime." int no
+option "geometry"    g "XML geometry file name"                                string yes
+option "output"      o "Output file name"                                      string yes
+option "prior"		 - "Prior image file name"								   string no
+option "wtv"		 - "Adaptive weighting vector image for TV"				   string no
+option "wprior"		 - "Adaptive weighting vector image for prior"			   string no
+option "niterations" n "Maximum number of iterations"                                  int    no   default="20"
+option "stop"	     c "Stopping criterion factor (default is to iterate till niterations)"	double no default="0"
+option "time"        t "Records elapsed time during the process"               flag   off
+option "lambda"      l "Regularization parameter"                              double no   default="1"
+option "alpha"       a "Prior image parameter"                                 double no   default="0.5"
+
+section "Projections"
+option "path"      p "Path containing projections"                               string                       yes
+option "regexp"    r "Regular expression to select projection files in path"     string                       yes
+option "nsort"     - "Numeric sort for regular expression matches"               flag                         off
+option "submatch"  - "Index of the submatch that will be used to sort matches"   int                          no   default="0"
+option "sortfile"  s "The csv file path used for sorting or selecting a subset of projections"	string		  no
+option "binnumber" - "The bin number of the reconstructed image if projection sorting is used"  int	no	default="1"
+option "truncation" - "Directory containing the calibration maps for truncation mismatch correction"       string no
+
+section "Methods"
+option "fp"    f "Forward projection method" values="Joseph","RayCastInterpolator","CudaRayCast" enum no default="Joseph"
+option "bp"    b "Back projection method" values="VoxelBasedBackProjection","Joseph","CudaVoxelBased","NormalizedJoseph" enum no default="VoxelBasedBackProjection"
+option "tv"    - "TV method" values="cpu","cuda" enum no default="cpu"
+option "tvgrad"  - "TV gradient method" values="cpu","cuda" enum no default="cpu"
+option "tvhessian"  - "TV Hessian method" values="cpu","cuda" enum no default="cpu"
+option "dd"  - "Displaced detector method" values="cpu","cuda" enum no default="cpu"
+
+section "Volume properties"
+option "input"     i "Input volume"              string          no
+option "origin"    - "Origin (default=centered)" double multiple no
+option "dimension" - "Dimension"                 int    multiple no  default="256"
+option "spacing"   - "Spacing"                   double multiple no  default="1"
+option "direction" - "Direction"                 double multiple no
+
+section "Motion-compensation described in [Rit et al, TMI, 2009] and [Rit et al, Med Phys, 2009]"
+option "signal"    - "Signal file name"          string    no
+option "dvf"       - "Input 4D DVF"              string    no

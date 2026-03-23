@@ -1,0 +1,13 @@
+package "igt"
+version "Creates an RTK geometry file from a Varian XIM acquisition (Truebeam)."
+
+option "config"     - "Config file"                                           string          no
+option "xml_file"   x "Varian XIM XML information file on projections"        string          yes
+option "angle_file" a "A separate angle file"								  string		  no
+option "output"     o "Output file name"                                      string          yes
+
+section "Projections"
+option "path"       p "Path containing projections"                               string                       yes
+option "regexp"     r "Regular expression to select projection files in path"     string                       yes
+option "nsort"      - "Numeric sort for regular expression matches"               flag                         off
+option "submatch"   - "Index of the submatch that will be used to sort matches"   int                          no   default="0"

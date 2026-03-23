@@ -1,0 +1,6 @@
+package "rtk"
+version "Creates an RTK geometry file from an Elekta XML file."
+
+option "config"    - "Config file"                                           string          no
+option "xmlfile"   x "Elekta XML information file on projections"        	 string          yes
+option "output"    o "Output file name"                                      string          yes

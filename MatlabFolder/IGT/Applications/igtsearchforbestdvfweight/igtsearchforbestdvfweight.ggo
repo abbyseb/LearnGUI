@@ -1,0 +1,20 @@
+package "igt"
+version "Search for the best DVF weighting."
+
+option "config"     - "Config file"                                                 					string  no
+option "verbose"    v "Verbose execution"                                           					flag    off
+option "output"     o "Output filename of the transformed image"            							string  yes
+option "outdvf"		g "The final DVF file"																string  yes
+option "result"     r "The result file saving the objective values"										string	yes
+option "input"      i "The input image to be transformed"												string	yes
+option "ref"		e "The reference image which the transformed input is compared to" 					string  yes
+option "dvf"        f "The DVF file for which the weighting is to be optimized"							string	yes
+option "dinit"      s "An initial constant DVF that is added to the DVF of interest with no weighting" 	string	no
+option "neg"		n "Transform using the inverted DVF"												flag	off
+option "metric"		m "Metric option" values="MSE","MI","MMI","NC","GD","MRSD" 							enum 	no 	default="MSE"
+option "low"	    l "The lower bound of the search range"												float   no  default="-1"
+option "up"	        u "The upper bound of the search range"												float   no  default="1"
+option "dw"         d "Increment for the search process"												float   no  default="0.02"
+option "imask"		- "The input image mask"															string  no
+option "rmask"		- "The reference image mask"														string  no
+option "thread"		t "The maximum number of threads"													int		no  default="32"

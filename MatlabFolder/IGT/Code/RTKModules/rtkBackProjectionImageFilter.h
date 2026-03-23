@@ -1,0 +1,158 @@
+/*=========================================================================
+ *
+ *  Copyright RTK Consortium
+ *
+ *  Licensed under the Apache License, Version 2.0 (the "License");
+ *  you may not use this file except in compliance with the License.
+ *  You may obtain a copy of the License at
+ *
+ *         http://www.apache.org/licenses/LICENSE-2.0.txt
+ *
+ *  Unless required by applicable law or agreed to in writing, software
+ *  distributed under the License is distributed on an "AS IS" BASIS,
+ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *  See the License for the specific language governing permissions and
+ *  limitations under the License.
+ *
+ *=========================================================================*/
+
+#ifndef __rtkBackProjectionImageFilter_h
+#define __rtkBackProjectionImageFilter_h
+
+#include "igtConfiguration.h"
+
+#include <itkInPlaceImageFilter.h>
+#include <itkConceptChecking.h>
+#include "rtkProjectionGeometry.h"
+#include "rtkCyclicDeformationImageFilter.h"
+#include "itkCovariantVector.h"
+
+#ifdef IGT_USE_CUDA
+  #include "itkCudaImage.h"
+  #include "rtkCudaCyclicDeformationImageFilter.h"
+#endif
+
+namespace rtk
+{
+
+/** \class BackProjectionImageFilter
+ * \brief 3D backprojection
+ *
+ * Backprojects a stack of projection images (input 1) in a 3D volume (input 0)
+ * using linear interpolation according to a specified geometry. The operation
+ * is voxel-based, meaning that the center of each voxel is projected in the
+ * projection images to determine the interpolation location.
+ *
+ * \test rtkfovtest.cxx
+ *
+ * \author Simon Rit
+ *
+ * \ingroup Projector
+ */
+template <class TInputImage, class TOutputImage>
+class BackProjectionImageFilter :
+  public itk::InPlaceImageFilter<TInputImage,TOutputImage>
+{
+public:
+  /** Standard class typedefs. */
+  typedef BackProjectionImageFilter                         Self;
+  typedef itk::ImageToImageFilter<TInputImage,TOutputImage> Superclass;
+  typedef itk::SmartPointer<Self>                           Pointer;
+  typedef itk::SmartPointer<const Self>                     ConstPointer;
+  typedef typename TInputImage::PixelType                   InputPixelType;
+  typedef typename TOutputImage::RegionType                 OutputImageRegionType;
+
+  typedef rtk::ProjectionGeometry<TOutputImage::ImageDimension>     GeometryType;
+  typedef typename GeometryType::Pointer                            GeometryPointer;
+  typedef typename GeometryType::MatrixType                         ProjectionMatrixType;
+  typedef itk::Image<InputPixelType, TInputImage::ImageDimension-1> ProjectionImageType;
+  typedef typename ProjectionImageType::Pointer                     ProjectionImagePointer;
+  
+  typedef itk::Vector<InputPixelType, TOutputImage::ImageDimension>		DVFPixelType;
+  typedef itk::Image< DVFPixelType, TOutputImage::ImageDimension > 		DVFImageType;
+  typedef rtk::CyclicDeformationImageFilter<DVFImageType>		  		DeformationType;
+  typedef typename DeformationType::Pointer 							DeformationPointer;
+
+#ifdef IGT_USE_CUDA
+  typedef itk::CovariantVector<InputPixelType, TOutputImage::ImageDimension> CudaDVFPixelType;
+  typedef itk::CudaImage< CudaDVFPixelType, TOutputImage::ImageDimension > 	 CudaDVFImageType;
+  typedef rtk::CudaCyclicDeformationImageFilter						  		 CudaDeformationType;
+  typedef typename CudaDeformationType::Pointer 							 CudaDeformationPointer;
+#endif
+
+  /** Method for creation through the object factory. */
+  itkNewMacro(Self);
+
+  /** Run-time type information (and related methods). */
+  itkTypeMacro(BackProjectionImageFilter, itk::ImageToImageFilter);
+
+  /** Get / Set the object pointer to projection geometry */
+  itkGetMacro(Geometry, GeometryPointer);
+  itkSetMacro(Geometry, GeometryPointer);
+
+  /** Get / Set the transpose flag for 2D projections (optimization trick) */
+  itkGetMacro(Transpose, bool);
+  itkSetMacro(Transpose, bool);
+
+  virtual void SetDeformation(DeformationPointer def){}
+
+#ifdef IGT_USE_CUDA
+  virtual void SetCudaDeformation(CudaDeformationPointer def){}
+#endif
+
+protected:
+  BackProjectionImageFilter() : m_Geometry(NULL), m_Transpose(false) {
+    this->SetNumberOfRequiredInputs(2); this->SetInPlace( true );
+  };
+  virtual ~BackProjectionImageFilter() {
+  }
+
+  /** Apply changes to the input image requested region. */
+  virtual void GenerateInputRequestedRegion();
+
+  virtual void ThreadedGenerateData( const OutputImageRegionType& outputRegionForThread, typename itk::ThreadIdType threadId );
+
+  /** Optimized version when the rotation is parallel to X, i.e. matrix[1][0]
+    and matrix[2][0] are zeros. */
+  virtual void OptimizedBackprojectionX(const OutputImageRegionType& region, const ProjectionMatrixType& matrix,
+                                        const ProjectionImagePointer projection);
+
+  /** Optimized version when the rotation is parallel to Y, i.e. matrix[1][1]
+    and matrix[2][1] are zeros. */
+  virtual void OptimizedBackprojectionY(const OutputImageRegionType& region, const ProjectionMatrixType& matrix,
+                                        const ProjectionImagePointer projection);
+
+  /** The two inputs should not be in the same space so there is nothing
+   * to verify. */
+  virtual void VerifyInputInformation() {}
+
+  /** The input is a stack of projections, we need to interpolate in one projection
+      for efficiency during interpolation. Use of itk::ExtractImageFilter is
+      not threadsafe in ThreadedGenerateData, this one is. The output can be multiplied by a constant.
+      The function is templated to allow getting an itk::CudaImage. */
+  template<class TProjectionImage>
+  typename TProjectionImage::Pointer GetProjection(const unsigned int iProj);
+
+  /** Creates iProj index to index projection matrices with current inputs
+      instead of the physical point to physical point projection matrix provided by Geometry */
+  ProjectionMatrixType GetIndexToIndexProjectionMatrix(const unsigned int iProj);
+
+private:
+  BackProjectionImageFilter(const Self&); //purposely not implemented
+  void operator=(const Self&);            //purposely not implemented
+
+  /** RTK geometry object */
+  GeometryPointer m_Geometry;
+
+  /** Flip projection flag: infludences GetProjection and
+    GetIndexToIndexProjectionMatrix for optimization */
+  bool m_Transpose;
+};
+
+} // end namespace rtk
+
+#ifndef ITK_MANUAL_INSTANTIATION
+#include "rtkBackProjectionImageFilter.txx"
+#endif
+
+#endif

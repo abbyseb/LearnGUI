@@ -1,0 +1,72 @@
+<?xml version="1.0" standalone="yes"?>
+<DataSetSessionInfo xmlns="http://baden.varian.com/DataSetSessionInfo.xsd">
+  <SessionInfo>
+    <PatientID>OBI AI TEST PT</PatientID>
+    <ModeID>thorax</ModeID>
+    <SessionID>2011.08.17 18_16_34</SessionID>
+    <Title />
+    <AssocDisease />
+    <Topogram />
+    <PulseControl />
+    <StartAngle>180</StartAngle>
+    <StartAngleExtendedFlag>false</StartAngleExtendedFlag>
+    <StopAngle>180</StopAngle>
+    <StopAngleExtendedFlag>true</StopAngleExtendedFlag>
+    <GantryRtnSpeed>0</GantryRtnSpeed>
+    <ConnectedMachineType>Undefined</ConnectedMachineType>
+    <NormalizationMethod>SingleImage</NormalizationMethod>
+    <ScatteringCorrection>None</ScatteringCorrection>
+    <PreProcessFilter>None</PreProcessFilter>
+    <PostProcessFilter />
+    <ConvolutionType>RamLak</ConvolutionType>
+    <ConvolutionFilter>Standard</ConvolutionFilter>
+    <ReconstructionVolumeXY>Vol512X512</ReconstructionVolumeXY>
+    <PatientPosition>HFS</PatientPosition>
+    <ScanRangeCenter>0</ScanRangeCenter>
+    <ScanRangeWidth>160</ScanRangeWidth>
+    <ScanZeroPosition>0</ScanZeroPosition>
+    <PatientSizeLat>273.0667</PatientSizeLat>
+    <PatientSizePA>273.0667</PatientSizePA>
+    <PatientSizeLng>273.0667</PatientSizeLng>
+    <FanType>FullFan</FanType>
+    <ReconstrImgOffsetX>0</ReconstrImgOffsetX>
+    <ReconstrImgOffsetY>0</ReconstrImgOffsetY>
+    <ReconstrImgOffsetZ>0</ReconstrImgOffsetZ>
+    <Voltage>110</Voltage>
+    <Current>40</Current>
+    <PulseLength>20</PulseLength>
+    <PulseMode />
+    <PhysicalFilter />
+    <ScatterGrid />
+    <SliceDistance>Dist2_0</SliceDistance>
+    <CalibratedSAD>1000</CalibratedSAD>
+    <CalibratedSID>1536</CalibratedSID>
+    <CalibratedDetectorOffsetX>0</CalibratedDetectorOffsetX>
+    <CalibratedDetectorOffsetY>0</CalibratedDetectorOffsetY>
+    <CalibratedNormAirCounts>0</CalibratedNormAirCounts>
+    <CalibratedHUSlope>0</CalibratedHUSlope>
+    <CalibratedHUOffset>0</CalibratedHUOffset>
+    <DetectorSizeX>409.6</DetectorSizeX>
+    <DetectorSizeY>409.6</DetectorSizeY>
+    <DetectorPosLat>0</DetectorPosLat>
+    <NumberOfScans>0</NumberOfScans>
+    <ScanType>SingleConeBeam</ScanType>
+    <ScanSequence>SingleScan</ScanSequence>
+    <RingArtSupression>Medium</RingArtSupression>
+    <DX_DR_RatioCustom>NaN</DX_DR_RatioCustom>
+    <DX_DT_RatioCustom>NaN</DX_DT_RatioCustom>
+  </SessionInfo>
+  <ScanInfo>
+    <ScanID>8/17/2011 6:17:05 PM</ScanID>
+    <ScanIndex>0</ScanIndex>
+    <SessionID>2011.08.17 18_16_34</SessionID>
+    <FolderPath>D:\VMSOS\AppData\CBCT\Rec\CBCTProjections\OBI AI TEST PT\2011.08.17 18_16_34\Scan0</FolderPath>
+    <CouchLng>1201</CouchLng>
+    <CouchVrt>-130</CouchVrt>
+    <CouchLat>-5</CouchLat>
+    <CouchRtn>0</CouchRtn>
+    <ScanWidth>160</ScanWidth>
+    <NumberOfProj>621</NumberOfProj>
+    <GantryRtnDir>CounterClockwise</GantryRtnDir>
+  </ScanInfo>
+</DataSetSessionInfo>

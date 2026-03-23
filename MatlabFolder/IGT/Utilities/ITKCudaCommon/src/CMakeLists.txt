@@ -1,0 +1,29 @@
+set(ITKCudaCommon_SRC
+    itkCudaContextManager.cxx
+    itkCudaDataManager.cxx
+    itkCudaKernelManager.cxx
+    itkCudaUtil.cxx
+  )
+
+# Avoid issue with command line too long for nvcc
+SET_DIRECTORY_PROPERTIES(PROPERTIES INCLUDE_DIRECTORIES "" )
+
+# This is necessary to include the win32 header from RTK
+# These lines should be removed if ITKCudaCommon is put as
+# an ITK module
+include_directories(${IGT_SOURCE_DIR}/Code)
+include_directories(${IGT_BINARY_DIR})
+
+include_directories(${CUDA_INCLUDE_DIRS})
+include_directories(${ITKCudaCommon_SOURCE_DIR}/include)
+include_directories(${ITK_INCLUDE_DIRS})
+add_library(ITKCudaCommon ${ITKCudaCommon_SRC})
+target_link_libraries(ITKCudaCommon ${ITKCommon_LIBRARIES} ${CUDA_CUDA_LIBRARY} ${CUDA_LIBRARIES})
+
+
+IF(NOT IGT_INSTALL_NO_LIBRARIES)
+  INSTALL(TARGETS ITKCudaCommon
+          RUNTIME DESTINATION ${IGT_INSTALL_RUNTIME_DIR} COMPONENT Runtime
+          LIBRARY DESTINATION ${IGT_INSTALL_LIB_DIR} COMPONENT RuntimeLibraries
+          ARCHIVE DESTINATION ${IGT_INSTALL_ARCHIVE_DIR} COMPONENT Development)
+ENDIF(NOT IGT_INSTALL_NO_LIBRARIES) 

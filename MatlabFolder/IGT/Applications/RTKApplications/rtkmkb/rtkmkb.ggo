@@ -1,0 +1,37 @@
+package "rtk"
+version "Reconstruct a 3D volume using the MKB method [Mckinnon & Bates, 1981]."
+
+option "verbose"    v "Verbose execution"                                           flag                         off
+option "config"     - "Config file"                                                 string                       no
+option "geometry"   g "XML geometry file name"                                      string                       yes
+option "output"     o "Output file name"                                            string                       yes
+option "input"		i "Input file name"												string						 no
+option "initial"    - "If no input file is specified, an initial 3D FDK image will be used and stored in this path"	string	no	default="FDK_3D.mha"
+option "hardware"   - "Hardware used for computation"                               values="cpu","cuda"			 no   default="cpu"
+option "lowmem"     l "Load only one projection per thread in memory"               flag                         off
+option "divisions"  d "Streaming option: number of stream divisions of the CT"      int                          no   default="1"
+option "subsetsize" - "Streaming option: number of projections processed at a time" int                          no   default="16"
+option "threshold"  t "Positivity thresholding on input image"						flag						 on
+option "step"		- "MKB step size"												double						 no default="1"
+
+section "Projections"
+option "path"      p "Path containing projections"                               string                       yes
+option "regexp"    r "Regular expression to select projection files in path"     string                       no	default=""
+option "nsort"     - "Numeric sort for regular expression matches"               flag                         off
+option "submatch"  - "Index of the submatch that will be used to sort matches"   int                          no   default="0"
+option "sortfile"  s "The csv file path used for sorting or selecting a subset of projections"	string		  	no
+option "binnumber" b "The bin number of the reconstructed image if projection sorting is used"  int	no	default="1"
+
+section "Ramp filter"
+option "pad"       - "Data padding parameter to correct for truncation"          double                       no   default="0.0"
+option "hann"      - "Cut frequency for hann window in ]0,1] (0.0 disables it)"  double                       no   default="0.0"
+option "hannY"     - "Cut frequency for hann window in ]0,1] (0.0 disables it)"  double                       no   default="0.0"
+
+section "Volume properties"
+option "origin"    - "Origin (default=centered)" double multiple no
+option "dimension" - "Dimension"                 int    multiple no  default="256"
+option "spacing"   - "Spacing"                   double multiple no  default="1"
+option "direction" - "Direction"                 double multiple no
+
+section "Projectors"
+option "fp"    f "Forward projection method" values="Joseph","RayCastInterpolator","CudaRayCast" enum no default="Joseph"

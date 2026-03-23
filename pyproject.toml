@@ -1,0 +1,122 @@
+# pyproject.toml - VoxelMap Data Preparation Interface
+# Medical Device Software per IEC 62304 / ISO 13485
+#
+# MATLAB Compatibility:
+#   - R2024a: Python 3.9, 3.10, 3.11
+#   - R2024b+: Python 3.9, 3.10, 3.11, 3.12
+#   Current target: Python 3.11 (max for R2024a)
+
+[tool.poetry]
+name = "voxelmap-gui"
+version = "1.0.0"
+description = "Clinical-grade data interface for AI-guided radiotherapy (VoxelMap)"
+authors = ["Alistair <amac2328@uni.sydney.edu.au>"]
+readme = "README.md"
+license = "Proprietary"
+packages = [{include = "voxelmap_gui", from = "src"}]
+
+# Metadata for traceability
+[tool.poetry.urls]
+"Documentation" = "https://github.com/your-org/voxelmap-gui/docs"
+"Bug Tracker" = "https://github.com/your-org/voxelmap-gui/issues"
+
+[tool.poetry.dependencies]
+python = "^3.11,<3.12"  # Pinned for MATLAB R2024a compatibility
+
+# === Core GUI ===
+PyQt6 = "^6.9.0"
+pyqtgraph = "^0.13.7"           # Optional: for future plotting needs
+
+# === Medical Imaging ===
+SimpleITK = "^2.5.0"            # MHA/DICOM volume handling
+pydicom = "^3.0.0"              # DICOM file parsing
+imageio = "^2.37.0"             # Image I/O utilities
+
+# === Scientific Computing ===
+numpy = "^2.0.0"                # Array operations (2.x for performance)
+scipy = "^1.14.0"               # Signal processing, interpolation
+matplotlib = "^3.9.0"           # Visualization, colormaps
+
+# === Utilities ===
+requests = "^2.32.0"            # API calls to prescription server
+pillow = "^11.0.0"              # Image manipulation
+
+[tool.poetry.group.dev.dependencies]
+# Development tools
+pytest = "^8.0.0"
+pytest-qt = "^4.4.0"            # PyQt6 testing
+pytest-cov = "^6.0.0"
+mypy = "^1.13.0"
+ruff = "^0.8.0"                 # Fast linter (replaces flake8/black/isort)
+
+[tool.poetry.group.docs.dependencies]
+# Documentation (optional)
+mkdocs = "^1.6.0"
+mkdocs-material = "^9.5.0"
+
+[tool.poetry.scripts]
+voxelmap = "voxelmap_gui.app:main"
+
+[build-system]
+requires = ["poetry-core>=1.0.0"]
+build-backend = "poetry.core.masonry.api"
+
+# =============================================================================
+# TOOL CONFIGURATIONS
+# =============================================================================
+
+[tool.ruff]
+target-version = "py311"
+line-length = 120
+select = [
+    "E",      # pycodestyle errors
+    "W",      # pycodestyle warnings
+    "F",      # Pyflakes
+    "I",      # isort
+    "B",      # flake8-bugbear
+    "C4",     # flake8-comprehensions
+    "UP",     # pyupgrade
+]
+ignore = [
+    "E501",   # line too long (handled by formatter)
+    "B008",   # function call in default argument
+]
+
+[tool.ruff.isort]
+known-first-party = ["voxelmap_gui"]
+
+[tool.mypy]
+python_version = "3.11"
+warn_return_any = true
+warn_unused_ignores = true
+disallow_untyped_defs = false   # Gradual typing adoption
+ignore_missing_imports = true   # For SimpleITK, pydicom stubs
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+qt_api = "pyqt6"
+addopts = "-v --tb=short"
+
+# =============================================================================
+# MATLAB COMPATIBILITY NOTES
+# =============================================================================
+# 
+# MATLAB Version Matrix:
+# ┌──────────┬─────────────────────────┬─────────────────────────────┐
+# │ MATLAB   │ Python Supported        │ Notes                       │
+# ├──────────┼─────────────────────────┼─────────────────────────────┤
+# │ R2024a   │ 3.9, 3.10, 3.11         │ Current target              │
+# │ R2024b   │ 3.9, 3.10, 3.11, 3.12   │ Adds Python 3.12            │
+# │ R2025a   │ 3.10, 3.11, 3.12, 3.13  │ Drops 3.9, adds 3.13        │
+# └──────────┴─────────────────────────┴─────────────────────────────┘
+#
+# Upgrade Path (when MATLAB R2024b+ available):
+# 1. Update python constraint: python = "^3.11,<3.13"
+# 2. Run: poetry lock --no-update
+# 3. Test with Python 3.12 in separate venv
+# 4. Update MATLAB_BIN path in backend.py
+#
+# For clinical deployment:
+# 1. poetry export -f requirements.txt --output requirements.txt
+# 2. Use requirements.txt for pip install on target machines
+# 3. Or: poetry build && pip install dist/*.whl

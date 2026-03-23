@@ -1,0 +1,8 @@
+package "igt"
+version "Subtract two 2D or 3D images in the least square sense. Image 2 will be scaled by x' = ax + b. The values of a and b will be printed when Verbose is on."
+
+option "config"     - "Config file"                                                 string                       no
+option "verbose"    v "Verbose execution"                                           flag                         off
+option "output"     o "Output csv file of the trajectory"            				string                       no
+option "input1"     i "The first input image file"									string						 yes
+option "input2"     j "The second input image file"									string						 yes

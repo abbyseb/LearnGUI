@@ -1,0 +1,13 @@
+package "igt"
+version "Register a series of projections to a series of reference projections."
+
+option "config"     - "Config file"                                                 string                       no
+option "verbose"    v "Verbose execution"                                           flag                         off
+option "output"     o "Output filename of the registered projections"            	string                       yes
+option "outpara"	p "Output filename of the transform parameters"					string						 yes
+option "moving"     m "The moving projections to be registered"						string						 yes
+option "fixed"      f "The fixed projections to be registered to"					string						 yes
+option "mask"		a "2D mask used to constrain the registration"					string						 no
+option "transform"	t "Transformation type" 	values="Translation","Rigid" enum no default="Rigid"
+option "metric"		c "Metric type" 	values="MMI","MS","NC" enum no default="MMI"
+option "inverse"    i "Register fixed to moving image instead and warp moving image using the inverse transform" flag	off

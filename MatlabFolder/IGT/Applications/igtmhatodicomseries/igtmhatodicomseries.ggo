@@ -1,0 +1,8 @@
+package "igt"
+version "Convert a mha volume file in int16 to a dicom series"
+
+option "config"     - "Config file"                                                 string                       no
+option "verbose"    v "Verbose execution"                                           flag                         off
+option "output"     o "Output folder path"            								string                       yes
+option "input"      i "The input mha volume file"									string						 yes
+option "permutation" p "The dimensional permutation. Default is [0,1,2]"			int 	multiple 			 yes

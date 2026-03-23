@@ -1,0 +1,15 @@
+package "rtk"
+version "Reads raw projection images, convert to attenuation and stack them in a single output image file"
+
+option "verbose"  v "Verbose execution"                                         flag      off
+option "config"   - "Config file"                                               string    no
+option "output"   o "Output file name"                                          string    yes
+option "attenuation"  a "Convert to attenuation values"                         flag      on
+
+section "Projections"
+option "path"      p "Path containing projections"                               string                       yes
+option "regexp"    r "Regular expression to select projection files in path"     string                       yes
+option "nsort"     - "Numeric sort for regular expression matches"               flag                         off
+option "submatch"  - "Index of the submatch that will be used to sort matches"   int                          no   default="0"
+option "sortfile"  s "The csv file path used for sorting or selecting a subset of projections"	string		  	no
+option "binnumber" b "The bin number of the reconstructed image if projection sorting is used"  int	no	default="1"

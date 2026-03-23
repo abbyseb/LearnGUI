@@ -1,0 +1,7 @@
+Metric,Value
+Shape,"(128, 128, 128, 3)"
+Dimensions,3
+Min Magnitude,0.001003
+Max Magnitude,0.856148
+Mean Magnitude,0.244219
+Standard Deviation,0.184916

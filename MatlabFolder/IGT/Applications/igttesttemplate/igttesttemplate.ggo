@@ -1,0 +1,9 @@
+package "igt"
+version "Test."
+
+option "config"     - "Config file"                                                 string                       no
+option "verbose"    v "Verbose execution"                                           flag                         off
+option "output"     o "Output csv file of the trajectory"            				string                       no
+option "input1"     i "The first input image file"									string						 no
+option "input2"     j "The second input image file"									string						 no
+option "geometry"   g "Geometry file"												string						 no

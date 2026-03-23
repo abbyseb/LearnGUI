@@ -1,0 +1,138 @@
+/*=========================================================================
+ *
+ *  Copyright RTK Consortium
+ *
+ *  Licensed under the Apache License, Version 2.0 (the "License");
+ *  you may not use this file except in compliance with the License.
+ *  You may obtain a copy of the License at
+ *
+ *         http://www.apache.org/licenses/LICENSE-2.0.txt
+ *
+ *  Unless required by applicable law or agreed to in writing, software
+ *  distributed under the License is distributed on an "AS IS" BASIS,
+ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *  See the License for the specific language governing permissions and
+ *  limitations under the License.
+ *
+ *=========================================================================*/
+
+#ifndef __rtkIterativeConeBeamReconstructionFilter_txx
+#define __rtkIterativeConeBeamReconstructionFilter_txx
+
+#include "rtkIterativeConeBeamReconstructionFilter.h"
+
+namespace rtk
+{
+  template<class TOutputImage, class ProjectionStackType>
+  IterativeConeBeamReconstructionFilter<TOutputImage, ProjectionStackType>
+  ::IterativeConeBeamReconstructionFilter()
+  {
+    m_CurrentForwardProjectionConfiguration = -1;
+    m_CurrentBackProjectionConfiguration = -1;
+	m_Deformation = 0;
+#ifdef IGT_USE_CUDA
+	m_CudaDeformation = 0;
+#endif
+  }
+
+  template<class TOutputImage, class ProjectionStackType>
+  typename IterativeConeBeamReconstructionFilter<TOutputImage, ProjectionStackType>::ForwardProjectionPointerType
+  IterativeConeBeamReconstructionFilter<TOutputImage, ProjectionStackType>
+  ::InstantiateForwardProjectionFilter (int fwtype)
+  {
+    ForwardProjectionPointerType fw;
+    switch(fwtype)
+      {
+      case(0):
+        fw = rtk::JosephForwardProjectionImageFilter<VolumeType, ProjectionStackType>::New();
+      break;
+      case(1):
+        fw = rtk::RayCastInterpolatorForwardProjectionImageFilter<VolumeType, ProjectionStackType>::New();
+      break;
+      case(2):
+      #ifdef IGT_USE_CUDA
+        fw = rtk::CudaForwardProjectionImageFilter<VolumeType, ProjectionStackType>::New();
+      #else
+        std::cerr << "The program has not been compiled with cuda option" << std::endl;
+      #endif
+      break;
+
+      default:
+        std::cerr << "Unhandled --forward value." << std::endl;
+      }
+    return fw;
+  }
+
+  template<class TOutputImage, class ProjectionStackType>
+  typename IterativeConeBeamReconstructionFilter<TOutputImage, ProjectionStackType>::BackProjectionPointerType
+  IterativeConeBeamReconstructionFilter<TOutputImage, ProjectionStackType>::InstantiateBackProjectionFilter(int bptype)
+  {
+    BackProjectionPointerType bp;
+    switch(bptype)
+      {
+      case(0):
+        bp = rtk::BackProjectionImageFilter<ProjectionStackType, VolumeType>::New();
+        break;
+      case(1):
+        bp = rtk::JosephBackProjectionImageFilter<ProjectionStackType, VolumeType>::New();
+        break;
+      case(2):
+      #ifdef IGT_USE_CUDA
+        bp = rtk::CudaBackProjectionImageFilter::New();
+      #else
+        std::cerr << "The program has not been compiled with cuda option" << std::endl;
+      #endif
+      break;
+      case(3):
+        bp = rtk::NormalizedJosephBackProjectionImageFilter<ProjectionStackType, VolumeType>::New();
+        break;
+      case(4):
+		if (!this->GetDeformation())
+			std::cerr << "DVF has not been set" << std::endl;
+		else
+		{
+			bp = WarpBackProjectionType::New();
+			bp->SetDeformation(this->GetDeformation());
+		}
+        break;
+      case(5):
+      #ifdef IGT_USE_CUDA
+	  		if (!this->GetCudaDeformation())
+				std::cerr << "DVF has not been set" << std::endl;
+			bp = rtk::CudaWarpBackProjectionImageFilter::New();
+			bp->SetCudaDeformation(this->GetCudaDeformation());
+      #else
+			std::cerr << "The program has not been compiled with cuda option" << std::endl;
+      #endif
+        break;
+
+      default:
+        std::cerr << "Unhandled --back value." << std::endl;
+      }
+    return bp;
+  }
+
+  template<class TOutputImage, class ProjectionStackType>
+  void
+  IterativeConeBeamReconstructionFilter<TOutputImage, ProjectionStackType>
+  ::SetForwardProjectionFilter (int fwtype)
+  {
+    if (m_CurrentForwardProjectionConfiguration != fwtype)
+      {
+      this->Modified();
+      }
+  }
+
+  template<class TOutputImage, class ProjectionStackType>
+  void
+  IterativeConeBeamReconstructionFilter<TOutputImage, ProjectionStackType>
+  ::SetBackProjectionFilter (int bptype)
+  {
+    if (m_CurrentBackProjectionConfiguration != bptype)
+      {
+      this->Modified();
+      }
+  }
+} // end namespace rtk
+
+#endif // __rtkIterativeConeBeamReconstructionFilter_txx

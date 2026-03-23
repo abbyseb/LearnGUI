@@ -1,0 +1,51 @@
+package "rtk"
+version "Direct in-situ target tracking using cone-beam projections."
+
+option "verbose"    v "Verbose execution"                                           flag                         off
+option "display"	- "Writing display images to current folder"			        flag						 off
+option "config"     - "Config file"                                                 string                       no
+option "geometry"   g "XML geometry file name"                                      string                       yes
+option "output"     o "Output csv file of the trajectory"            				string                       yes
+
+section "Prior"
+option "priorpath"  - "Path containing the prior images"                            string                       no
+option "priorexp"   - "Regular expression to select prior files in path"     		string                       no	default=""
+option "priornsort" - "Numeric sort for prior regular expression matches"           flag                         off
+
+section "Model"
+option "modelpath"  - "Path containing the model images"                            string                       yes
+option "modelexp"   - "Regular expression to select model files in path"     		string                       no	default=""
+option "modelnsort" - "Numeric sort for model regular expression matches"           flag                         off
+
+section "DTS specifics"
+option "arcsize"	- "The number of projections considered for the tracking arc"	int							 no	  default="60"
+option "prearc"		- "The number of projections used for pre-tracking"				int							 no   default="300"
+option "first"		- "The first frame to be tracked"								int							 no   default="1"
+option "last"		- "The last frame to be tracked"								int							 no
+option "step"		- "The step between each frame"									int							 no   default="1"
+
+section "Iterative options"
+option "niterations" n "Maximum number of iterations"                                  int    no   default="50"
+option "stop"	     c "Stopping criterion factor (default is 0.01 mm)"				   double no   default="0.01"
+option "lambdaID"    - "In-depth regularization strength"                              double no   default="1"
+option "lambdaIP"	 - "In-plane regularization strength"					   		   double no   default="0.1"
+option "lambdaSI"	 - "SI regularization strength"							   		   double no   default="0.1"
+option "gammaID"     - "In-depth regularization order"                                 int    no   default="2"
+option "gammaIP"	 - "In-plane regularization order"					               int    no   default="2"
+option "gammaSI"	 - "SI regularization order"					            	   int    no   default="2"
+option "optimizer"   - "The algorithm used to find optimal solution" values="CG","GD" enum no default="CG"
+
+section "Sorting"
+option "sortfile"  s "The csv file path used for sorting or selecting a subset of projections"	string		  	 yes
+
+section "Projections"
+option "path"      p "Path containing projections"                               	string                       yes
+option "regexp"    r "Regular expression to select projection files in path"     	string                       no	default=""
+option "nsort"     - "Numeric sort for regular expression matches"               	flag                         off
+option "submatch"  - "Index of the submatch that will be used to sort matches"   	int                          no   default="0"
+
+section "Forward projectors"
+option "fp"    f "Forward projection method" values="Joseph","RayCastInterpolator","CudaRayCast" enum no
+
+section "Data fidelity"
+option "metric" - "Data fidelity metric in the objective function" values="L2","NCC" enum no default="L2"
