@@ -1,0 +1,17 @@
+(Registration "MultiResolutionRegistration")
+(FixedImagePyramid "FixedRecursiveImagePyramid")
+(MovingImagePyramid "MovingRecursiveImagePyramid")
+(Interpolator "LinearInterpolator")
+(Metric "AdvancedMattesMutualInformation")
+(Optimizer "AdaptiveStochasticGradientDescent")
+(ResampleInterpolator "FinalLinearInterpolator")
+(Resampler "DefaultResampler")
+(Transform "RecursiveBSplineTransform")
+
+(NumberOfResolutions 3)
+(MaximumNumberOfIterations 500)
+(NumberOfSpatialSamples 2048)
+
+(DefaultPixelValue 0.0)
+(WriteResultImage "true")
+(ResultImageFormat "mha")

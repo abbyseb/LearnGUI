@@ -1,0 +1,11 @@
+PyQt6
+SimpleITK
+itk
+itk-rtk
+itk-elastix
+numpy
+requests
+matplotlib
+scipy
+pydicom
+
