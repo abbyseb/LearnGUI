@@ -351,22 +351,16 @@ class MainWindow(QMainWindow):
                 dvf_options = source._dvf_sources.copy()
                 dest.set_dvf_sources(dvf_options)
 
-            # 3. Copy the state
-            # Copy rebind toggle
-            if hasattr(source, 'chk_rebind'):
-                dest.chk_rebind.setChecked(source.chk_rebind.isChecked())
-
-            # Copy opacity
-            if hasattr(source, 'sld_alpha'):
-                dest.sld_alpha.setValue(source.sld_alpha.value())
-
-            # Copy current DVF selection
-            current_dvf_key = source.cmb_dvf.currentData()
-            if current_dvf_key:
-                new_index = dest.cmb_dvf.findData(current_dvf_key)
-                if new_index >= 0:
-                    dest.cmb_dvf.setCurrentIndex(new_index)
-                    # _on_dvf_phase_changed will be triggered, loading the DVF
+            # 3. Copy the state (widgets live on DVFInfoWidget, not DVFPanel)
+            si, di = getattr(source, "dvf_info", None), getattr(dest, "dvf_info", None)
+            if si is not None and di is not None:
+                di.chk_rebind.setChecked(si.chk_rebind.isChecked())
+                di.sld_alpha.setValue(si.sld_alpha.value())
+                current_dvf_key = si.cmb_dvf.currentData()
+                if current_dvf_key:
+                    new_index = di.cmb_dvf.findData(current_dvf_key)
+                    if new_index >= 0:
+                        di.cmb_dvf.setCurrentIndex(new_index)
 
         except Exception as e:
             self.controller.log(f"Error cloning DVF viewer: {e}", "ERROR")

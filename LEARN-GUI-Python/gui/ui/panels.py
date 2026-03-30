@@ -1159,6 +1159,120 @@ def nice_ceil_mm(x: float) -> float:
     return float(math.ceil(x))
 
 
+def _dvf_scalar_zyx_to_log_volume(
+    arr_zyx: np.ndarray,
+    sar_params: dict,
+    perm_phys_to_log: tuple[int, int, int] | None,
+) -> np.ndarray:
+    """Same spatial mapping as scalar DVF magnitude (zyx array from GetArrayFromImage)."""
+    perm = sar_params["perm_zyx_to_SAR"]
+    flips = sar_params["flips_SAR"]
+    vol_SAR = np.transpose(arr_zyx, perm)
+    if flips[0]:
+        vol_SAR = vol_SAR[::-1, :, :]
+    if flips[1]:
+        vol_SAR = vol_SAR[:, ::-1, :]
+    if flips[2]:
+        vol_SAR = vol_SAR[:, :, ::-1]
+    if perm_phys_to_log is None:
+        return vol_SAR
+    return np.transpose(vol_SAR, perm_phys_to_log)
+
+
+def _dvf_inplane_mm(
+    vec_log: np.ndarray,
+    perm_phys_to_log: tuple[int, int, int] | None,
+    iS: int,
+    iA: int,
+    iR: int,
+    view: str,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    In-plane displacement (mm) for axial / coronal / sagittal slice.
+    vec_log[..., c] follows the same component order as ITK after per-channel resample.
+    perm_phys_to_log maps logical slice axes to source component indices (numpy transpose tuple).
+    """
+    p = perm_phys_to_log if perm_phys_to_log is not None else (0, 1, 2)
+    if view == "ax":
+        va = vec_log[iS, :, :, p[1]]
+        vb = vec_log[iS, :, :, p[2]]
+    elif view == "co":
+        va = vec_log[:, iA, :, p[0]]
+        vb = vec_log[:, iA, :, p[2]]
+    else:
+        va = vec_log[:, :, iR, p[0]]
+        vb = vec_log[:, :, iR, p[1]]
+    return va.astype(np.float32), vb.astype(np.float32)
+
+
+def _overlay_arrows_on_rgb(
+    rgb: np.ndarray,
+    u: np.ndarray,
+    v: np.ndarray,
+    row_spacing_mm: float,
+    col_spacing_mm: float,
+    *,
+    step: int,
+    length_scale: float,
+    max_arrows: int,
+    min_mag_mm: float,
+) -> None:
+    """Draw arrows on float RGB (H,W,3) in place. u = along row (increasing y), v = along col (increasing x)."""
+    if rgb.ndim != 3 or rgb.shape[2] != 3:
+        return
+    H, W = u.shape
+    if v.shape != (H, W):
+        return
+    inv_sr = 1.0 / max(float(row_spacing_mm), 1e-6)
+    inv_sc = 1.0 / max(float(col_spacing_mm), 1e-6)
+    mag = np.sqrt(u * u + v * v)
+    pts: list[tuple[int, int]] = []
+    st = max(1, int(step))
+    for i in range(0, H, st):
+        for j in range(0, W, st):
+            if mag[i, j] >= min_mag_mm:
+                pts.append((i, j))
+    if not pts:
+        return
+    if len(pts) > max_arrows:
+        stride = max(1, int(np.ceil(len(pts) / float(max_arrows))))
+        pts = pts[::stride][:max_arrows]
+
+    col = np.array([255.0, 235.0, 80.0], dtype=np.float32)
+
+    def _pix(yy: int, xx: int, a: float = 1.0) -> None:
+        if 0 <= yy < H and 0 <= xx < W:
+            rgb[yy, xx] = (1.0 - a) * rgb[yy, xx] + a * col
+
+    for i, j in pts:
+        du = float(u[i, j]) * inv_sr * length_scale
+        dv = float(v[i, j]) * inv_sc * length_scale
+        y1 = i + du
+        x1 = j + dv
+        length = float(np.hypot(x1 - j, y1 - i))
+        if length < 0.5:
+            continue
+        x0, y0 = float(j), float(i)
+        n = max(int(np.ceil(length)), 1)
+        for t in range(n + 1):
+            tt = t / n
+            y = int(round(y0 + tt * (y1 - y0)))
+            x = int(round(x0 + tt * (x1 - x0)))
+            _pix(y, x, 0.85)
+        ang = np.arctan2(y1 - y0, x1 - x0)
+        ah = max(2.5, min(8.0, 0.22 * length))
+        for sign in (-1.0, 1.0):
+            a2 = ang + sign * np.deg2rad(150.0)
+            hx = x1 + ah * np.cos(a2)
+            hy = y1 + ah * np.sin(a2)
+            hn = max(int(np.ceil(ah)), 1)
+            for t in range(hn + 1):
+                tt = t / hn
+                y = int(round(y1 + tt * (hy - y1)))
+                x = int(round(x1 + tt * (hx - x1)))
+                _pix(y, x, 0.75)
+
+
 # ===============================================
 # DVF PANEL CLASS
 # ===============================================
@@ -1180,6 +1294,7 @@ class DVFPanel(CTQuadPanel):
         self.dvf_info.dvf_changed.connect(self._on_dvf_phase_changed)
         self.dvf_info.opacity_changed.connect(self._on_alpha_changed)
         self.dvf_info.rebind_changed.connect(lambda checked: self.apply_plane_swap(checked))
+        self.dvf_info.arrow_settings_changed.connect(self._update_triptych)
 
         # 4. DVF Data State
         self._dvf_paths: Dict[str, Path] = {}
@@ -1189,6 +1304,8 @@ class DVFPanel(CTQuadPanel):
         
         self._dvf_log0: Optional[np.ndarray] = None   # magnitude in original logical (A,S,R)
         self._dvf_log: Optional[np.ndarray] = None    # magnitude in current logical (may be S,A,R)
+        self._dvf_vec_log0: Optional[np.ndarray] = None  # (S,A,R,3) mm, same grid as _dvf_log0
+        self._dvf_vec_log: Optional[np.ndarray] = None
         self._dvf_vmax: float = 10.0
         self._dvf_alpha: float = 0.45 # Default opacity matches slider default
         
@@ -1218,9 +1335,11 @@ class DVFPanel(CTQuadPanel):
         self._levels0 = getattr(self, "_levels", None)
         
         # When a new CT is loaded, we must also reset the DVF cache
-        self._dvf_log0 = None 
+        self._dvf_log0 = None
         self._dvf_log = None
-        
+        self._dvf_vec_log0 = None
+        self._dvf_vec_log = None
+
         # Explicitly reset slice indices to center
         if self._cS is not None:
             self._iS, self._iA, self._iR = self._cS, self._cA, self._cR
@@ -1242,6 +1361,10 @@ class DVFPanel(CTQuadPanel):
             if self._dvf_log0 is not None:
                 # Toggle logic for DVF-only
                 self._dvf_log = np.transpose(self._dvf_log0, (1, 0, 2)) if active else self._dvf_log0
+                if self._dvf_vec_log0 is not None:
+                    self._dvf_vec_log = (
+                        np.transpose(self._dvf_vec_log0, (1, 0, 2, 3)) if active else self._dvf_vec_log0
+                    )
                 self._update_triptych()
             return
             
@@ -1251,12 +1374,16 @@ class DVFPanel(CTQuadPanel):
             vol_to_assign = self._vol_log0
             spacing_to_assign = self._spacing_log0
             self._dvf_log = self._dvf_log0 if self._dvf_log0 is not None else None
+            self._dvf_vec_log = self._dvf_vec_log0 if self._dvf_vec_log0 is not None else None
         else:
             # TOGGLE ON (swapped): Swap S <-> A
             vol_to_assign = np.transpose(self._vol_log0, (1, 0, 2))
             s0, a0, r0 = self._spacing_log0
             spacing_to_assign = (a0, s0, r0)
             self._dvf_log = np.transpose(self._dvf_log0, (1, 0, 2)) if self._dvf_log0 is not None else None
+            self._dvf_vec_log = (
+                np.transpose(self._dvf_vec_log0, (1, 0, 2, 3)) if self._dvf_vec_log0 is not None else None
+            )
 
         self._assign_logical(vol_to_assign, spacing_to_assign)
 
@@ -1368,6 +1495,9 @@ class DVFPanel(CTQuadPanel):
             # None selected → remove overlay
             self._dvf_log0 = None
             self._dvf_log = None
+            self._dvf_vec_log0 = None
+            self._dvf_vec_log = None
+            self.dvf_info.set_arrows_available(False)
             self.dvf_info.lbl_dvf_stats.setText("—")
             self._update_triptych()
             return
@@ -1422,14 +1552,50 @@ class DVFPanel(CTQuadPanel):
                 ov_log = np.transpose(vol_SAR, self._perm_phys_to_log)
 
             self._dvf_log0 = ov_log.astype(np.float32)
-            
+
+            self._dvf_vec_log0 = None
+            if comps >= 3 and self._sitk_base_img is not None:
+                try:
+                    layers: list[np.ndarray] = []
+                    for ci in range(min(comps, 3)):
+                        cimg = sitk.VectorIndexSelectionCast(img, ci)
+                        m1 = sitk.Resample(
+                            cimg,
+                            self._sitk_base_img,
+                            sitk.Transform(),
+                            sitk.sitkLinear,
+                            0.0,
+                            cimg.GetPixelID(),
+                        )
+                        arr_zyx = sitk.GetArrayFromImage(m1).astype(np.float32)
+                        if hasattr(self, "_sar_reorient_params") and self._sar_reorient_params:
+                            ov_c = _dvf_scalar_zyx_to_log_volume(
+                                arr_zyx, self._sar_reorient_params, self._perm_phys_to_log
+                            )
+                        else:
+                            vol_SAR_c, _ = self._reorient_image_to_SAR_numpy(m1)
+                            if self._perm_phys_to_log is None:
+                                ov_c = vol_SAR_c
+                            else:
+                                ov_c = np.transpose(vol_SAR_c, self._perm_phys_to_log)
+                        layers.append(ov_c.astype(np.float32))
+                    if len(layers) == 3:
+                        self._dvf_vec_log0 = np.stack(layers, axis=-1)
+                except Exception:
+                    self._dvf_vec_log0 = None
+
+            self.dvf_info.set_arrows_available(self._dvf_vec_log0 is not None)
+
             # Apply current swap state
-            self.apply_plane_swap(self._swap_active) 
-            
+            self.apply_plane_swap(self._swap_active)
+
         except Exception as e:
             traceback.print_exc()
             self._dvf_log0 = None
             self._dvf_log = None
+            self._dvf_vec_log0 = None
+            self._dvf_vec_log = None
+            self.dvf_info.set_arrows_available(False)
             self.dvf_info.lbl_dvf_stats.setText(f"Err: {e}")
             self._update_triptych()
 
@@ -1495,6 +1661,61 @@ class DVFPanel(CTQuadPanel):
             for rgb, dvf in ((ax_rgb, dvf_ax), (co_rgb, dvf_co), (sa_rgb, dvf_sa)):
                 if dvf is not None and dvf.shape == rgb.shape[:2]:
                     blend(rgb, dvf)
+
+            if (
+                self.dvf_info.arrows_enabled()
+                and self._dvf_vec_log is not None
+                and self._dvf_vec_log.shape[:3] == self._vol_log.shape
+                and self._dvf_vec_log.shape[-1] >= 3
+                and self._spacing_log is not None
+            ):
+                perm = self._perm_phys_to_log
+                sp = self._spacing_log
+                try:
+                    ua, va = _dvf_inplane_mm(self._dvf_vec_log, perm, iS, iA, iR, "ax")
+                    ua = np.flipud(np.fliplr(ua))
+                    va = np.flipud(np.fliplr(va))
+                    _overlay_arrows_on_rgb(
+                        ax_rgb,
+                        ua,
+                        va,
+                        sp[1],
+                        sp[2],
+                        step=self.dvf_info.spn_arrow_step.value(),
+                        length_scale=float(self.dvf_info.dbl_arrow_length.value()),
+                        max_arrows=int(self.dvf_info.spn_arrow_max.value()),
+                        min_mag_mm=float(self.dvf_info.dbl_arrow_min_mag.value()),
+                    )
+                    uc, vc = _dvf_inplane_mm(self._dvf_vec_log, perm, iS, iA, iR, "co")
+                    uc = np.flipud(np.fliplr(uc))
+                    vc = np.flipud(np.fliplr(vc))
+                    _overlay_arrows_on_rgb(
+                        co_rgb,
+                        uc,
+                        vc,
+                        sp[0],
+                        sp[2],
+                        step=self.dvf_info.spn_arrow_step.value(),
+                        length_scale=float(self.dvf_info.dbl_arrow_length.value()),
+                        max_arrows=int(self.dvf_info.spn_arrow_max.value()),
+                        min_mag_mm=float(self.dvf_info.dbl_arrow_min_mag.value()),
+                    )
+                    us, vs = _dvf_inplane_mm(self._dvf_vec_log, perm, iS, iA, iR, "sa")
+                    us = np.flipud(np.fliplr(us))
+                    vs = np.flipud(np.fliplr(vs))
+                    _overlay_arrows_on_rgb(
+                        sa_rgb,
+                        us,
+                        vs,
+                        sp[0],
+                        sp[1],
+                        step=self.dvf_info.spn_arrow_step.value(),
+                        length_scale=float(self.dvf_info.dbl_arrow_length.value()),
+                        max_arrows=int(self.dvf_info.spn_arrow_max.value()),
+                        min_mag_mm=float(self.dvf_info.dbl_arrow_min_mag.value()),
+                    )
+                except Exception:
+                    pass
         else:
              self.dvf_info.lbl_dvf_stats.setText("—")
 
@@ -1562,10 +1783,13 @@ class DVFPanel(CTQuadPanel):
         super().clear() # Call base CTQuadPanel.clear()
         self._dvf_log0 = None
         self._dvf_log = None
+        self._dvf_vec_log0 = None
+        self._dvf_vec_log = None
         self._dvf_paths.clear()
         self._dvf_sources.clear()
-        
+
         self.dvf_info.update_dvf_list({})
         self.dvf_info.lbl_dvf_stats.setText("—")
         self.dvf_info.chk_rebind.setChecked(False)
         self.dvf_info.sld_alpha.setValue(45)
+        self.dvf_info.set_arrows_available(True)

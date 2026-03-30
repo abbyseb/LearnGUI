@@ -9,12 +9,10 @@ from PyQt6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QDoubleSpinBox,
-    QFileDialog,
     QFormLayout,
     QGroupBox,
     QHBoxLayout,
     QLabel,
-    QLineEdit,
     QPushButton,
     QSlider,
     QSpinBox,
@@ -190,11 +188,12 @@ class CTInfoWidget(BaseInfoWidget):
 class DVFInfoWidget(BaseInfoWidget):
     """
     Specific Info Panel for DVFs.
-    Contains: DVF File Selector, Statistics, Scale Legend, Opacity, Rebind Toggle.
+    Contains: DVF File Selector, Statistics, Scale Legend, Opacity, Rebind Toggle, Arrows.
     """
     dvf_changed = pyqtSignal(int, object)  # index, dvf_key (None or str)
     opacity_changed = pyqtSignal(int)   # 0-100
     rebind_changed = pyqtSignal(bool)   # checked
+    arrow_settings_changed = pyqtSignal()
 
     def __init__(self):
         super().__init__("DVF Info")
@@ -231,9 +230,68 @@ class DVFInfoWidget(BaseInfoWidget):
         self.chk_rebind.stateChanged.connect(lambda: self.rebind_changed.emit(self.chk_rebind.isChecked()))
         self.layout.addRow("Plane:", self.chk_rebind)
 
+        # --- 6. DVF arrows (vector field; scalar DVF files hide these) ---
+        self.chk_arrows = QCheckBox("Show displacement arrows")
+        self.chk_arrows.setToolTip("Requires 3-component DVF; in-plane part on each slice")
+        self.chk_arrows.stateChanged.connect(self._emit_arrow_settings)
+        self.layout.addRow("Arrows:", self.chk_arrows)
+
+        self.spn_arrow_step = QSpinBox()
+        self.spn_arrow_step.setRange(2, 64)
+        self.spn_arrow_step.setValue(8)
+        self.spn_arrow_step.setToolTip("Sample every N pixels along row/column")
+        self.spn_arrow_step.valueChanged.connect(self._emit_arrow_settings)
+
+        self.dbl_arrow_length = QDoubleSpinBox()
+        self.dbl_arrow_length.setRange(0.25, 30.0)
+        self.dbl_arrow_length.setSingleStep(0.25)
+        self.dbl_arrow_length.setValue(3.0)
+        self.dbl_arrow_length.setToolTip("Length scale (mm displacement → screen pixels)")
+        self.dbl_arrow_length.valueChanged.connect(self._emit_arrow_settings)
+
+        self.spn_arrow_max = QSpinBox()
+        self.spn_arrow_max.setRange(200, 20000)
+        self.spn_arrow_max.setSingleStep(200)
+        self.spn_arrow_max.setValue(2500)
+        self.spn_arrow_max.setToolTip("Max arrows drawn per view")
+        self.spn_arrow_max.valueChanged.connect(self._emit_arrow_settings)
+
+        self.dbl_arrow_min_mag = QDoubleSpinBox()
+        self.dbl_arrow_min_mag.setRange(0.0, 5.0)
+        self.dbl_arrow_min_mag.setSingleStep(0.05)
+        self.dbl_arrow_min_mag.setValue(0.05)
+        self.dbl_arrow_min_mag.setToolTip("Skip arrows where |DVF| is below this (mm)")
+        self.dbl_arrow_min_mag.valueChanged.connect(self._emit_arrow_settings)
+
+        self.layout.addRow("Arrow step (px):", self.spn_arrow_step)
+        self.layout.addRow("Arrow length scale:", self.dbl_arrow_length)
+        self.layout.addRow("Max arrows / view:", self.spn_arrow_max)
+        self.layout.addRow("Min |DVF| (mm):", self.dbl_arrow_min_mag)
+
+    def _emit_arrow_settings(self, *_args):
+        self.arrow_settings_changed.emit()
+
     def _on_dvf_emit(self, idx):
         key = self.cmb_dvf.itemData(idx)
         self.dvf_changed.emit(idx, key)
+
+    def arrows_enabled(self) -> bool:
+        return self.chk_arrows.isChecked()
+
+    def set_arrows_available(self, available: bool) -> None:
+        """Scalar DVF: disable arrow controls."""
+        for w in (
+            self.chk_arrows,
+            self.spn_arrow_step,
+            self.dbl_arrow_length,
+            self.spn_arrow_max,
+            self.dbl_arrow_min_mag,
+        ):
+            w.setEnabled(bool(available))
+        if not available:
+            self.chk_arrows.blockSignals(True)
+            self.chk_arrows.setChecked(False)
+            self.chk_arrows.blockSignals(False)
 
     def update_dvf_list(self, dvf_map: dict, current_key=None):
         self.cmb_dvf.blockSignals(True)
@@ -280,181 +338,25 @@ class DRRInfoWidget(BaseInfoWidget):
         self.lbl_ct_sel.setVisible(False)
         self.cmb_ct.setVisible(False)
 
-        # --- DRR generation (used on next pipeline DRR step) ---
-        self._grp_drr_gen = QGroupBox("DRR setup (next run)")
-        self._grp_drr_gen.setStyleSheet(
-            "QGroupBox { font-size: 10pt; } QGroupBox::title { subcontrol-origin: margin; left: 8px; }"
-        )
-        gf = QFormLayout(self._grp_drr_gen)
-        gf.setVerticalSpacing(6)
-
-        self.cmb_geom_source = QComboBox()
-        self.cmb_geom_source.addItem("XML file (exact shipped matrices)", "xml")
-        self.cmb_geom_source.addItem("Circular orbit (SID / SDD / angles)", "circular")
-        self.cmb_geom_source.currentIndexChanged.connect(lambda *_: self._sync_drr_geom_widgets())
-        gf.addRow("Geometry:", self.cmb_geom_source)
-
-        hl_xml = QHBoxLayout()
-        self._ed_geom_xml = QLineEdit()
-        _def_xml = (
+    def get_drr_generation_options(self) -> dict:
+        """Defaults for modules.drr_generation.generate.generate_drrs (matches former panel values)."""
+        _bundled_xml = (
             Path(__file__).resolve().parent.parent.parent
             / "modules"
             / "drr_generation"
             / "RTKGeometry_360.xml"
         )
-        self._ed_geom_xml.setText(str(_def_xml))
-        self._btn_geom_xml = QPushButton("Browse…")
-        self._btn_geom_xml.clicked.connect(self._browse_geom_xml)
-        hl_xml.addWidget(self._ed_geom_xml, 1)
-        hl_xml.addWidget(self._btn_geom_xml)
-        gf.addRow("XML path:", hl_xml)
-
-        self._spin_sid = QDoubleSpinBox()
-        self._spin_sid.setRange(100.0, 3000.0)
-        self._spin_sid.setDecimals(1)
-        self._spin_sid.setValue(1000.0)
-        self._spin_sid.setSuffix(" mm")
-        self._spin_sid.setToolTip("Source-to-isocenter distance (matches XML tag of the same name).")
-        gf.addRow("SID:", self._spin_sid)
-
-        self._spin_sdd = QDoubleSpinBox()
-        self._spin_sdd.setRange(100.0, 4000.0)
-        self._spin_sdd.setDecimals(1)
-        self._spin_sdd.setValue(1500.0)
-        self._spin_sdd.setSuffix(" mm")
-        self._spin_sdd.setToolTip("Source-to-detector distance.")
-        gf.addRow("SDD:", self._spin_sdd)
-
-        self._spin_first_ang = QDoubleSpinBox()
-        self._spin_first_ang.setRange(-360.0, 360.0)
-        self._spin_first_ang.setDecimals(2)
-        self._spin_first_ang.setValue(0.0)
-        self._spin_first_ang.setSuffix("°")
-        gf.addRow("First gantry °:", self._spin_first_ang)
-
-        self._spin_step_ang = QDoubleSpinBox()
-        self._spin_step_ang.setRange(0.1, 90.0)
-        self._spin_step_ang.setDecimals(3)
-        self._spin_step_ang.setValue(3.0)
-        self._spin_step_ang.setSuffix("°")
-        gf.addRow("Angle step:", self._spin_step_ang)
-
-        self._spin_nproj = QSpinBox()
-        self._spin_nproj.setRange(1, 720)
-        self._spin_nproj.setValue(120)
-        self._spin_nproj.setToolTip("Number of projections (circular mode). XML mode ignores this.")
-        gf.addRow("# projections:", self._spin_nproj)
-
-        self._spin_det_ox = QDoubleSpinBox()
-        self._spin_det_oy = QDoubleSpinBox()
-        self._spin_det_oz = QDoubleSpinBox()
-        for sp, v in ((self._spin_det_ox, -200.0), (self._spin_det_oy, -150.0), (self._spin_det_oz, 0.0)):
-            sp.setRange(-2000.0, 2000.0)
-            sp.setDecimals(3)
-            sp.setValue(v)
-            sp.setSuffix(" mm")
-        hl_o = QHBoxLayout()
-        hl_o.addWidget(QLabel("X"))
-        hl_o.addWidget(self._spin_det_ox)
-        hl_o.addWidget(QLabel("Y"))
-        hl_o.addWidget(self._spin_det_oy)
-        hl_o.addWidget(QLabel("Z"))
-        hl_o.addWidget(self._spin_det_oz)
-        gf.addRow("Detector origin:", hl_o)
-
-        self._spin_det_sx = QDoubleSpinBox()
-        self._spin_det_sy = QDoubleSpinBox()
-        self._spin_det_sz = QDoubleSpinBox()
-        for sp, v in ((self._spin_det_sx, 0.388), (self._spin_det_sy, 0.388), (self._spin_det_sz, 1.0)):
-            sp.setRange(0.001, 50.0)
-            sp.setDecimals(4)
-            sp.setValue(v)
-            sp.setSuffix(" mm")
-        hl_s = QHBoxLayout()
-        hl_s.addWidget(QLabel("dX"))
-        hl_s.addWidget(self._spin_det_sx)
-        hl_s.addWidget(QLabel("dY"))
-        hl_s.addWidget(self._spin_det_sy)
-        hl_s.addWidget(QLabel("dZ"))
-        hl_s.addWidget(self._spin_det_sz)
-        gf.addRow("Detector spacing:", hl_s)
-
-        self._spin_det_nx = QSpinBox()
-        self._spin_det_ny = QSpinBox()
-        self._spin_det_nx.setRange(64, 4096)
-        self._spin_det_ny.setRange(64, 4096)
-        self._spin_det_nx.setValue(1024)
-        self._spin_det_ny.setValue(768)
-        hl_n = QHBoxLayout()
-        hl_n.addWidget(QLabel("W"))
-        hl_n.addWidget(self._spin_det_nx)
-        hl_n.addWidget(QLabel("H"))
-        hl_n.addWidget(self._spin_det_ny)
-        gf.addRow("Detector pixels:", hl_n)
-
-        tip = QLabel(
-            "XML = use precomputed projection matrices (same as forward_project.py). "
-            "Circular = RTK AddProjection with your SID/SDD and angle list. "
-            "Detector block maps to ConstantImageSource (how the detector grid sits in mm)."
-        )
-        tip.setWordWrap(True)
-        tip.setStyleSheet("color: #888; font-size: 9pt;")
-        gf.addRow(tip)
-
-        self.layout.addRow(self._grp_drr_gen)
-
-        self._circular_widgets = [
-            self._spin_sid,
-            self._spin_sdd,
-            self._spin_first_ang,
-            self._spin_step_ang,
-            self._spin_nproj,
-        ]
-        self._xml_widgets = [self._ed_geom_xml, self._btn_geom_xml]
-        self._sync_drr_geom_widgets()
-
-    def _sync_drr_geom_widgets(self) -> None:
-        use_xml = self.cmb_geom_source.currentData() == "xml"
-        for w in self._xml_widgets:
-            w.setEnabled(use_xml)
-        for w in self._circular_widgets:
-            w.setEnabled(not use_xml)
-
-    def _browse_geom_xml(self) -> None:
-        p, _ = QFileDialog.getOpenFileName(
-            self,
-            "RTK geometry XML",
-            str(Path(self._ed_geom_xml.text()).parent),
-            "XML (*.xml);;All (*)",
-        )
-        if p:
-            self._ed_geom_xml.setText(p)
-
-    def get_drr_generation_options(self) -> dict:
-        """Kwargs fragment for modules.drr_generation.generate.generate_drrs (after train_dir)."""
-        src = self.cmb_geom_source.currentData()
         return {
-            "geometry_path": Path(self._ed_geom_xml.text().strip()),
-            "geometry_source": src if src else "xml",
-            "circular_sid_mm": float(self._spin_sid.value()),
-            "circular_sdd_mm": float(self._spin_sdd.value()),
-            "circular_first_angle_deg": float(self._spin_first_ang.value()),
-            "circular_angle_step_deg": float(self._spin_step_ang.value()),
-            "circular_num_projections": int(self._spin_nproj.value()),
-            "detector_origin": (
-                float(self._spin_det_ox.value()),
-                float(self._spin_det_oy.value()),
-                float(self._spin_det_oz.value()),
-            ),
-            "detector_spacing": (
-                float(self._spin_det_sx.value()),
-                float(self._spin_det_sy.value()),
-                float(self._spin_det_sz.value()),
-            ),
-            "detector_size_xy": (
-                int(self._spin_det_nx.value()),
-                int(self._spin_det_ny.value()),
-            ),
+            "geometry_path": _bundled_xml,
+            "geometry_source": "circular",
+            "circular_sid_mm": 1000.0,
+            "circular_sdd_mm": 1500.0,
+            "circular_first_angle_deg": 0.0,
+            "circular_angle_step_deg": 3.0,
+            "circular_num_projections": 120,
+            "detector_origin": (-200.0, -150.0, 0.0),
+            "detector_spacing": (0.388, 0.388, 1.0),
+            "detector_size_xy": (1024, 768),
         }
 
     def update_ct_list(self, ct_names: list, user_data: list):

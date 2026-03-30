@@ -25,7 +25,7 @@ def downsample_volume(input_path, output_path, target_size=(128, 128, 128)):
     resampler.SetSize(target_size)
     resampler.SetOutputOrigin(image.GetOrigin())
     resampler.SetOutputSpacing(out_spacing)
-    resampler.SetOutputDirection(image.GetOutputDirection())
+    resampler.SetOutputDirection(image.GetDirection())
     resampler.Update()
     
     resampled_image = resampler.GetOutput()
