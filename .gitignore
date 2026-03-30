@@ -14,20 +14,20 @@ build/
 .idea/
 
 logs/
-train/
-test/
-Runs/
-*_Run_*
+# train/
+# test/
+# Runs/
+# *_Run_*
 *.log
 # Large Binaries and Data
-*.mha
-*.mhd
-*.mat
-*.exe
-*.dll
-*.pyd
-*.lib
-*.raw
-*.bin
-*.nii
-*.nii.gz
+# *.mha
+# *.mhd
+# *.mat
+# *.exe
+# *.dll
+# *.pyd
+# *.lib
+# *.raw
+# *.bin
+# *.nii
+# *.nii.gz
