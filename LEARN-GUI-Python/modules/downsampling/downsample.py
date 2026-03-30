@@ -7,36 +7,41 @@ from typing import Callable, Optional
 def downsample_volume(input_path, output_path, target_size=(128, 128, 128)):
     """
     Downsamples a 3D volume to a target size, matching the MATLAB logic.
+    Calculates spacing to cover the full physical extent of the input.
     """
-    image = itk.imread(input_path)
+    image = itk.imread(str(input_path))
+    in_size = itk.size(image)
+    in_spacing = image.GetSpacing()
     
-    # In MATLAB: imresize3 to [512, 256, 512] then slice 1:4, 1:2, 1:4 -> [128, 128, 128]
-    # We can directly resample to [128, 128, 128] using ITK
-    
-    # Calculate new spacing to reach target size [128, 128, 128] 
-    # but the MATLAB code explicitly sets info.PixelDimensions = [1, 1, 1]
+    # Calculate spacing to fit in_size*in_spacing into target_size
+    out_spacing = [
+        (in_size[i] * in_spacing[i]) / target_size[i]
+        for i in range(3)
+    ]
     
     interpolator = itk.LinearInterpolateImageFunction.New(image)
-    
     resampler = itk.ResampleImageFilter.New(image)
     resampler.SetInterpolator(interpolator)
     resampler.SetSize(target_size)
-    resampler.SetOutputOrigin([0, 0, 0])
-    resampler.SetOutputSpacing([1.0, 1.0, 1.0])
-    resampler.SetOutputDirection(itk.matrix_from_array(np.eye(3)))
-    
-    # Match the MATLAB behavior of clipping negative values (if any)
-    resampled_image = resampler.GetOutput()
+    resampler.SetOutputOrigin(image.GetOrigin())
+    resampler.SetOutputSpacing(out_spacing)
+    resampler.SetOutputDirection(image.GetOutputDirection())
     resampler.Update()
     
+    resampled_image = resampler.GetOutput()
     arr = itk.GetArrayFromImage(resampled_image)
     arr[arr < 0] = 0
     
+    # Match MATLAB downsampleVALKIMvolumes.m:
+    # info.Offset = [0, 0, 0]; info.PixelDimensions = [1, 1, 1];
+    # We overwrite the physical metadata so Elastix/Transformix output
+    # matches the unit-coordinate system expected by the DVF viewer.
     final_image = itk.GetImageFromArray(arr)
     final_image.SetSpacing([1.0, 1.0, 1.0])
     final_image.SetOrigin([0, 0, 0])
+    final_image.SetDirection(itk.matrix_from_array(np.eye(3)))
     
-    itk.imwrite(final_image, output_path)
+    itk.imwrite(final_image, str(output_path))
     print(f"Saved downsampled volume to {output_path}")
 
 def process_directory(
