@@ -132,6 +132,7 @@ class DICOMPreviewEngine(QObject):
     # Signals
     frame_ready = pyqtSignal(object, object, object, dict)  # ax, co, sa pixmaps + info
     discovery_update = pyqtSignal(int)  # total files found
+    series_catalog_changed = pyqtSignal(list)  # list[tuple[str, str]] (label, series_uid)
     
     # Default CT window
     DEFAULT_WL, DEFAULT_WW = -600.0, 1500.0
@@ -160,6 +161,10 @@ class DICOMPreviewEngine(QObject):
         # Series grouping
         self._series_map: Dict[str, List[DicomSlice]] = defaultdict(list)
         self._active_uid: Optional[str] = None
+        self._manual_series_lock = False  # True after user picks a series in the COPY helper
+        self._catalog_timer = QTimer(self)
+        self._catalog_timer.setSingleShot(True)
+        self._catalog_timer.timeout.connect(self._emit_series_catalog)
         
         # Sorting
         self._sorted_slices: List[DicomSlice] = []
@@ -200,6 +205,7 @@ class DICOMPreviewEngine(QObject):
     def stop(self):
         """Stop all activity."""
         self._is_running = False
+        self._catalog_timer.stop()
         self._discovery_timer.stop()
         self._display_timer.stop()
         
@@ -208,7 +214,41 @@ class DICOMPreviewEngine(QObject):
             sl.clear_cache()
         self._slices.clear()
         self._volume = None
-    
+        self._manual_series_lock = False
+
+    def _effective_active_uid(self) -> Optional[str]:
+        if self._manual_series_lock and self._active_uid and self._active_uid in self._series_map:
+            return self._active_uid
+        if not self._series_map:
+            return None
+        return max(self._series_map.keys(), key=lambda u: len(self._series_map[u]))
+
+    def set_active_series_uid(self, uid: Optional[str]) -> None:
+        """'' or None = auto (largest series); otherwise lock preview to that SeriesInstanceUID."""
+        u = (uid or "").strip()
+        if not u:
+            self._manual_series_lock = False
+            self._active_uid = None
+        else:
+            self._manual_series_lock = True
+            self._active_uid = u if u in self._series_map else None
+        self._sorted_valid = False
+        self._display_index = 0
+
+    def _emit_series_catalog(self) -> None:
+        if not self._is_running:
+            return
+        opts: List[tuple[str, str]] = []
+        for uid, slices in sorted(self._series_map.items(), key=lambda kv: -len(kv[1])):
+            n = len(slices)
+            short = f"{uid[:10]}…" if len(uid) > 12 else uid
+            opts.append((f"{n} slices · {short}", uid))
+        self.series_catalog_changed.emit(opts)
+
+    def _schedule_emit_catalog(self) -> None:
+        if self._is_running:
+            self._catalog_timer.start(150)
+
     # ========================================================================
     # FILE DISCOVERY (lightweight)
     # ========================================================================
@@ -280,17 +320,18 @@ class DICOMPreviewEngine(QObject):
             # Add to series bucket
             self._series_map[sl.series_uid].append(sl)
             
-            # Determine active series (largest)
-            if self._active_uid is None:
-                self._active_uid = sl.series_uid
-            else:
-                # If this new slice belongs to a series that is now larger than the active one, switch.
-                current_len = len(self._series_map[self._active_uid])
-                new_len = len(self._series_map[sl.series_uid])
-                if new_len > current_len:
+            # Auto-pick largest series while user has not locked a choice
+            if not self._manual_series_lock:
+                if self._active_uid is None:
                     self._active_uid = sl.series_uid
+                elif self._active_uid in self._series_map:
+                    current_len = len(self._series_map[self._active_uid])
+                    new_len = len(self._series_map[sl.series_uid])
+                    if new_len > current_len:
+                        self._active_uid = sl.series_uid
             
             self._sorted_valid = False # Mark sort as dirty
+            self._schedule_emit_catalog()
             
             # Memory management
             self._cleanup_old_caches()
@@ -320,11 +361,11 @@ class DICOMPreviewEngine(QObject):
     def _get_sorted_slices(self) -> List[DicomSlice]:
         """Get slices sorted by instance number for the ACTIVE series only."""
         if not self._sorted_valid:
-            if self._active_uid and self._active_uid in self._series_map:
-                # Only grab slices from the active (largest) series
-                active_group = self._series_map[self._active_uid]
+            eff = self._effective_active_uid()
+            if eff and eff in self._series_map:
+                active_group = self._series_map[eff]
                 self._sorted_slices = sorted(
-                    active_group, 
+                    active_group,
                     key=lambda s: (s.instance_number, s.path.name)
                 )
             else:
@@ -417,9 +458,9 @@ class DICOMPreviewEngine(QObject):
                 if self._logger: self._logger("DEBUG: Preview engine started but no slices found in active series yet.")
                 self._no_slices_logged = True
             return
-            
+
         self._no_slices_logged = False
-            
+
         # 3. Display Phase: Increment carousel index
         self._display_index = (self._display_index + 1) % len(slices)
         sl = slices[self._display_index]
@@ -468,7 +509,9 @@ class DICOMPreviewEngine(QObject):
             self.frame_ready.emit(ax_pm, co_pm, sa_pm, info)
             
             if not self._first_frame_logged:
-                if self._logger: self._logger(f"INFO: DICOM preview active. Showing series {self._active_uid[:8]}...")
+                eff = self._effective_active_uid() or ""
+                if self._logger and eff:
+                    self._logger(f"INFO: DICOM preview active. Showing series {eff[:8]}...")
                 self._first_frame_logged = True
             
         except Exception as e:

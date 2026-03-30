@@ -16,9 +16,8 @@ except ImportError:
 _PACKAGE_ROOT = Path(__file__).resolve().parent  # LEARN-GUI-Python/gui
 _PROJECT_ROOT = _PACKAGE_ROOT.parent             # LEARN-GUI-Python
 
-# Standalone configuration
-# All data and runs are local to the project root for standalone operation by default
-_DEFAULT_DATA_DIR = str(_PROJECT_ROOT / "data")
+# Standalone configuration — default clinical data root (read prescriptions / DICOM sources from here)
+_DEFAULT_DATA_DIR = "/Volumes/research-data/PRJ-RPL/2RESEARCH/1_ClinicalData"
 BASE_DIR = _DEFAULT_DATA_DIR
 WORK_ROOT = str(_PROJECT_ROOT / "Runs")
 
@@ -31,8 +30,11 @@ def set_data_root(new_root: str):
     return False
 
 
-# Ensure directories exist
-Path(BASE_DIR).mkdir(parents=True, exist_ok=True)
+# Runs folder under the project; clinical data root is external (no mkdir if volume missing)
+try:
+    Path(BASE_DIR).mkdir(parents=True, exist_ok=True)
+except OSError:
+    pass
 Path(WORK_ROOT).mkdir(parents=True, exist_ok=True)
 
 # API Configuration (same as original)

@@ -2,11 +2,11 @@
 from __future__ import annotations
 from pathlib import Path
 from PyQt6.QtCore import QSize, Qt, pyqtSignal, QTimer, QPoint, QEvent, QObject
-from PyQt6.QtGui import QPainter, QColor, QPixmap, QImage, QIcon
+from PyQt6.QtGui import QPainter, QColor, QPixmap, QImage, QIcon, QTransform
 from PyQt6.QtWidgets import (
     QGroupBox, QVBoxLayout, QLabel, QGridLayout, QFormLayout,
     QWidget, QSlider, QComboBox, QSizePolicy, QCheckBox, QHBoxLayout,
-    QScrollArea, QPushButton, QStyle
+    QScrollArea, QPushButton, QStyle, QDoubleSpinBox,
 )
 import numpy as np
 import matplotlib
@@ -777,9 +777,10 @@ class CTQuadPanel(QGroupBox):
         super().resizeEvent(e)
 
 # ===============================================
-# DRR Cine Viewer (Unchanged)
+# DRR Cine Viewer
 # ===============================================
 from ..ui.info_panels import DRRInfoWidget
+
 
 class DRRViewerPanel(QGroupBox):
     def __init__(self, title: str = "Digitally Reconstructed Radiographs (DRRs)"):
@@ -792,7 +793,7 @@ class DRRViewerPanel(QGroupBox):
         self._is_playing = False
         self._playback_fps = 15
         self._projections_per_ct = 120 # Default
-        
+
         # Build UI
         root_layout = QVBoxLayout(self)
         root_layout.setSpacing(8)
@@ -805,7 +806,7 @@ class DRRViewerPanel(QGroupBox):
         viewer_container = QWidget()
         v_lay = QVBoxLayout(viewer_container)
         v_lay.setContentsMargins(0,0,0,0)
-        
+
         self.main_view = QLabel(alignment=Qt.AlignmentFlag.AlignCenter)
         self.main_view.setMinimumSize(600, 500)
         self.main_view.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
@@ -831,6 +832,54 @@ class DRRViewerPanel(QGroupBox):
         controls.addWidget(QLabel("Speed:"))
         controls.addWidget(self.spin_speed)
         v_lay.addLayout(controls)
+
+        self._grp_view_display = QGroupBox("Display (on-screen only; does not change saved PNGs)")
+        disp = self._grp_view_display
+        disp.setStyleSheet("QGroupBox { font-size: 10pt; } QGroupBox::title { subcontrol-origin: margin; left: 8px; }")
+        disp_l = QVBoxLayout(disp)
+        disp_l.setSpacing(4)
+        r1 = QHBoxLayout()
+        r1.addWidget(QLabel("Rotate:"))
+        self._spin_view_rotate = QDoubleSpinBox()
+        self._spin_view_rotate.setRange(-360.0, 360.0)
+        self._spin_view_rotate.setDecimals(2)
+        self._spin_view_rotate.setSingleStep(0.5)
+        self._spin_view_rotate.setSuffix("°")
+        self._spin_view_rotate.setMinimumWidth(88)
+        self._spin_view_rotate.valueChanged.connect(self._on_view_transform_changed)
+        r1.addWidget(self._spin_view_rotate)
+        for deg, lab in ((0, "0°"), (90, "90°"), (180, "180°"), (270, "270°")):
+            b = QPushButton(lab)
+            b.setFixedWidth(36)
+            b.clicked.connect(lambda _, d=deg: self._spin_view_rotate.setValue(float(d)))
+            r1.addWidget(b)
+        bm = QPushButton("−90°")
+        bm.setFixedWidth(44)
+        bm.clicked.connect(lambda: self._spin_view_rotate.setValue(self._spin_view_rotate.value() - 90.0))
+        bp = QPushButton("+90°")
+        bp.setFixedWidth(44)
+        bp.clicked.connect(lambda: self._spin_view_rotate.setValue(self._spin_view_rotate.value() + 90.0))
+        r1.addWidget(bm)
+        r1.addWidget(bp)
+        br = QPushButton("Reset")
+        br.setToolTip("Rotation 0°, no flips")
+        br.clicked.connect(self._reset_view_display)
+        r1.addWidget(br)
+        r1.addStretch(1)
+        disp_l.addLayout(r1)
+        r2 = QHBoxLayout()
+        self._chk_view_flip_h = QCheckBox("Flip horizontal")
+        self._chk_view_flip_v = QCheckBox("Flip vertical")
+        self._chk_view_transpose = QCheckBox("Transpose (swap W↔H)")
+        self._chk_view_transpose.setToolTip("Mirror across the main diagonal (like matrix transpose)")
+        for c in (self._chk_view_flip_h, self._chk_view_flip_v, self._chk_view_transpose):
+            c.toggled.connect(self._on_view_transform_changed)
+        r2.addWidget(self._chk_view_flip_h)
+        r2.addWidget(self._chk_view_flip_v)
+        r2.addWidget(self._chk_view_transpose)
+        r2.addStretch(1)
+        disp_l.addLayout(r2)
+        v_lay.addWidget(disp)
         
         # Right: Info Panel
         self.info_panel = DRRInfoWidget()
@@ -846,9 +895,7 @@ class DRRViewerPanel(QGroupBox):
         self.lbl_status = QLabel("Waiting for DRR generation...")
         self.lbl_status.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.lbl_status.setStyleSheet("color: #999; font-size: 11pt;")
-        # Overlay status on top of main_view logic requires stacking, or just swapping
-        # For simplicity, we swap visibility or just use main_view to show text
-        
+
         self.playback_timer = QTimer(self)
         self.playback_timer.timeout.connect(self._on_timer_tick)
         self._set_controls_enabled(False)
@@ -865,7 +912,57 @@ class DRRViewerPanel(QGroupBox):
         self.info_panel.set_status("—", "—", "—")
         self.main_view.clear()
         self.main_view.setText("Waiting for DRR generation...")
+        self._reset_view_display(silent=True)
         self._set_controls_enabled(False)
+
+    def copy_view_display_settings_from(self, src: "DRRViewerPanel") -> None:
+        """Match on-screen transform controls (e.g. when cloning a step tab)."""
+        self._spin_view_rotate.blockSignals(True)
+        self._spin_view_rotate.setValue(src._spin_view_rotate.value())
+        self._spin_view_rotate.blockSignals(False)
+        self._chk_view_flip_h.setChecked(src._chk_view_flip_h.isChecked())
+        self._chk_view_flip_v.setChecked(src._chk_view_flip_v.isChecked())
+        self._chk_view_transpose.setChecked(src._chk_view_transpose.isChecked())
+
+    def _reset_view_display(self, silent: bool = False) -> None:
+        self._spin_view_rotate.blockSignals(True)
+        self._spin_view_rotate.setValue(0.0)
+        self._spin_view_rotate.blockSignals(False)
+        self._chk_view_flip_h.setChecked(False)
+        self._chk_view_flip_v.setChecked(False)
+        self._chk_view_transpose.setChecked(False)
+        if not silent and self._current_ct is not None:
+            self._display_frame(self._current_frame)
+
+    def _on_view_transform_changed(self, *_args) -> None:
+        if self._current_ct is not None:
+            self._display_frame(self._current_frame)
+
+    def _maybe_transpose_pixmap(self, pm: QPixmap) -> QPixmap:
+        """Swap image axes (x↔y), same as matrix transpose on pixel indices."""
+        if not self._chk_view_transpose.isChecked() or pm.isNull():
+            return pm
+        # x' = y, y' = x  →  m11=0,m12=1,m21=1,m22=0 in Qt's column-major 2×2 part
+        tr = QTransform(0, 1, 1, 0, 0, 0)
+        return pm.transformed(tr, Qt.TransformationMode.SmoothTransformation)
+
+    def _transform_pixmap_for_view(self, src: QPixmap) -> QPixmap:
+        """Apply transpose (optional), flips, then rotation around image centre."""
+        if src.isNull():
+            return src
+        p = self._maybe_transpose_pixmap(src)
+        w, h = p.width(), p.height()
+        if w <= 0 or h <= 0:
+            return p
+        t = QTransform()
+        t.translate(w / 2.0, h / 2.0)
+        if self._chk_view_flip_h.isChecked():
+            t.scale(-1.0, 1.0)
+        if self._chk_view_flip_v.isChecked():
+            t.scale(1.0, -1.0)
+        t.rotate(self._spin_view_rotate.value())
+        t.translate(-w / 2.0, -h / 2.0)
+        return p.transformed(t, Qt.TransformationMode.SmoothTransformation)
     
     def set_total_projections(self, count: int):
         """Update the expected total number of projections per CT."""
@@ -878,8 +975,16 @@ class DRRViewerPanel(QGroupBox):
 
     def set_loading_state(self, ct_count: int):
         self.clear()
-        msg = f"Waiting for DRRs from {ct_count} CT volume(s)..." if ct_count > 0 else "No CT volumes found."
+        if ct_count > 0:
+            msg = (
+                f"Generating DRRs from {ct_count} CT volume(s) (Joseph forward projection).\n\n"
+                "PNG projections appear here as they are written (bone = white, air = black)."
+            )
+        else:
+            msg = "No CT volumes found."
         self.main_view.setText(msg)
+        self.main_view.setStyleSheet("color: #9aa0a6; font-size: 12pt;")
+        self.main_view.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
     def add_frame(self, ct_index: int, proj_index: int, ct_name: str, frame: object, angle: float):
         if ct_index not in self._ct_data:
@@ -893,9 +998,11 @@ class DRRViewerPanel(QGroupBox):
         if self._current_ct is None:
             self._current_ct = ct_index
             self._set_controls_enabled(True)
-            self.main_view.setText("") 
+            self.main_view.setText("")
 
-        if self._current_ct == ct_index:
+        # Avoid repainting the main view for every projection during bulk load (COMPRESS → many .bin
+        # updates): only refresh when this slot is the one the user is viewing.
+        if self._current_ct == ct_index and proj_index == self._current_frame:
             self._display_frame(proj_index)
 
     def add_ct_frames(self, ct_index, ct_name, files, frames, angles):
@@ -925,23 +1032,45 @@ class DRRViewerPanel(QGroupBox):
             self.info_panel.set_status("—", "—", "—")
 
     def _display_frame(self, frame_idx: int):
-        if self._current_ct is None: return
+        if self._current_ct is None:
+            return
         data = self._ct_data[self._current_ct]
-        
-        if frame_idx not in data['frames']: return
-        
+
+        if frame_idx not in data["frames"]:
+            return
+
         self._current_frame = frame_idx
-        pixmap = data['frames'][frame_idx]
-        angle = data['angles'][frame_idx]
-        
+        pixmap = data["frames"][frame_idx]
+        angle = data["angles"][frame_idx]
+
         if pixmap and not pixmap.isNull():
-            scaled = pixmap.scaled(self.main_view.size(), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+            self.main_view.setStyleSheet("background-color: #000; border: 1px solid #444;")
+            transformed = self._transform_pixmap_for_view(pixmap)
+            scaled = transformed.scaled(
+                self.main_view.size(),
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
             self.main_view.setPixmap(scaled)
-        
-        # Update Info Panel
+
         w, h = pixmap.width(), pixmap.height()
-        self.info_panel.set_status(f"{frame_idx + 1} / {self._projections_per_ct}", f"{angle:.1f}°", f"{w}×{h}")
-        
+        gantry = f"{angle:.1f}°"
+        vr = self._spin_view_rotate.value()
+        extras = []
+        if abs(vr) > 1e-6:
+            extras.append(f"view {vr:+.1f}°")
+        if self._chk_view_flip_h.isChecked():
+            extras.append("flipH")
+        if self._chk_view_flip_v.isChecked():
+            extras.append("flipV")
+        if self._chk_view_transpose.isChecked():
+            extras.append("T")
+        if extras:
+            gantry = f"{gantry} ({', '.join(extras)})"
+        self.info_panel.set_status(
+            f"{frame_idx + 1} / {self._projections_per_ct}", gantry, f"{w}×{h}"
+        )
+
         self.slider.blockSignals(True)
         self.slider.setValue(frame_idx)
         self.slider.blockSignals(False)
@@ -983,11 +1112,16 @@ class DRRViewerPanel(QGroupBox):
         if ct_id is not None: self._display_ct(ct_id)
 
     def _set_controls_enabled(self, en):
-        self.btn_play.setEnabled(en); self.slider.setEnabled(en); self.spin_speed.setEnabled(en)
+        self.btn_play.setEnabled(en)
+        self.slider.setEnabled(en)
+        self.spin_speed.setEnabled(en)
+        # Display transforms stay enabled so rotation/flips can be preset before frames exist.
+        self._grp_view_display.setEnabled(True)
 
     def resizeEvent(self, e):
         super().resizeEvent(e)
-        if self._current_ct is not None: self._display_frame(self._current_frame)
+        if self._current_ct is not None:
+            self._display_frame(self._current_frame)
 
 
 # ===============================================
@@ -1050,6 +1184,8 @@ class DVFPanel(CTQuadPanel):
         # 4. DVF Data State
         self._dvf_paths: Dict[str, Path] = {}
         self._dvf_sources: dict[str, str] = {}
+        # path resolve key -> (mtime_ns, size, max magnitude) to avoid re-reading all DVFs on each poll
+        self._dvf_vmax_file_cache: Dict[str, Tuple[int, int, float]] = {}
         
         self._dvf_log0: Optional[np.ndarray] = None   # magnitude in original logical (A,S,R)
         self._dvf_log: Optional[np.ndarray] = None    # magnitude in current logical (may be S,A,R)
@@ -1169,41 +1305,57 @@ class DVFPanel(CTQuadPanel):
         self._update_dvf_legend()
 
     def _auto_set_vmax_from_all_dvfs(self):
-        """Calculate global vmax from all DVFs in self._dvf_sources."""
+        """Calculate global vmax from DVFs; cache per file (mtime/size) so polls stay cheap."""
         if not self._dvf_sources:
             self._dvf_vmax = 10.0
+            self._dvf_vmax_file_cache.clear()
             return
-        
+
         try:
             import SimpleITK as sitk
         except Exception:
             return
-        
+
+        active_keys: set[str] = set()
         global_max = 0.0
-        
+
         for _, path_str in self._dvf_sources.items():
             try:
                 path = Path(path_str)
-                if not path.exists(): continue
-                
+                if not path.exists():
+                    continue
+                key = str(path.resolve())
+                active_keys.add(key)
+                st = path.stat()
+                sig = (st.st_mtime_ns, st.st_size)
+                cached = self._dvf_vmax_file_cache.get(key)
+                if cached is not None and cached[0] == sig[0] and cached[1] == sig[1]:
+                    global_max = max(global_max, cached[2])
+                    continue
+
                 img = sitk.ReadImage(str(path))
                 comps = int(img.GetNumberOfComponentsPerPixel()) if hasattr(img, 'GetNumberOfComponentsPerPixel') else 1
-                
+
                 if comps > 1:
-                    try: mag = sitk.VectorMagnitude(img)
-                    except: 
+                    try:
+                        mag = sitk.VectorMagnitude(img)
+                    except Exception:
                         chans = [sitk.VectorIndexSelectionCast(img, c) for c in range(comps)]
                         mag = sitk.Sqrt(sum([sitk.Square(c) for c in chans]))
                 else:
                     mag = sitk.Cast(img, sitk.sitkFloat32)
-                
+
                 arr = sitk.GetArrayViewFromImage(mag)
-                if arr.size:
-                    m = float(np.nanmax(np.asarray(arr)))
-                    if m > global_max: global_max = m
+                m = float(np.nanmax(np.asarray(arr))) if arr.size else 0.0
+                self._dvf_vmax_file_cache[key] = (sig[0], sig[1], m)
+                global_max = max(global_max, m)
             except Exception:
                 continue
-        
+
+        for k in list(self._dvf_vmax_file_cache.keys()):
+            if k not in active_keys:
+                del self._dvf_vmax_file_cache[k]
+
         if global_max > 0:
             self._dvf_vmax = nice_ceil_mm(global_max)
         else:

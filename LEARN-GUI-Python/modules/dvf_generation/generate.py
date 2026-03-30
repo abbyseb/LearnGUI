@@ -1,43 +1,34 @@
-import itk
-import os
-import time
+"""3D DVF generation using ITK-Elastix (pure Python)."""
+from pathlib import Path
 
-def generate_dvf(fixed_path, moving_path, parameter_path, output_path):
-    """
-    Generates a 3D DVF using Python itk-elastix.
-    """
-    fixed_image = itk.imread(fixed_path, itk.F)
-    moving_image = itk.imread(moving_path, itk.F)
-    
-    parameter_object = itk.ParameterObject.New()
-    parameter_object.AddParameterFile(parameter_path)
-    
-    ImageType = type(fixed_image)
-    elastix_object = itk.ElastixRegistrationMethod[ImageType, ImageType].New()
-    elastix_object.SetFixedImage(fixed_image)
-    elastix_object.SetMovingImage(moving_image)
-    elastix_object.SetParameterObject(parameter_object)
-    elastix_object.SetLogToConsole(False)
-    
-    print(f"Starting itk-elastix registration...")
-    start = time.time()
-    elastix_object.Update()
-    print(f"Registration completed in {time.time() - start:.2f}s")
-    
-    # Generate the DVF using Transformix
-    transform_parameter_object = elastix_object.GetTransformParameterObject()
-    transformix_object = itk.TransformixFilter[ImageType].New()
-    transformix_object.SetMovingImage(moving_image)
-    transformix_object.SetTransformParameterObject(transform_parameter_object)
-    transformix_object.SetComputeDeformationField(True)
-    transformix_object.SetLogToConsole(False)
-    
-    transformix_object.Update()
-    dvf = transformix_object.GetOutputDeformationField()
-    itk.imwrite(dvf, output_path)
-    print(f"Saved Python DVF to {output_path}")
-    return True
+def generate_dvf(fixed_path: Path, moving_path: Path, param_path: Path, output_path: Path) -> None:
+    """Register moving to fixed, output DVF."""
+    import itk
 
-if __name__ == "__main__":
-    # Example usage
-    generate_dvf("fixed.mha", "moving.mha", "params.txt", "dvf.mha")
+    fixed_path = Path(fixed_path)
+    moving_path = Path(moving_path)
+    param_path = Path(param_path)
+    output_path = Path(output_path)
+
+    fixed_img = itk.imread(str(fixed_path), itk.F)
+    moving_img = itk.imread(str(moving_path), itk.F)
+
+    param_obj = itk.ParameterObject.New()
+    param_obj.AddParameterFile(str(param_path))
+
+    ImageType = type(fixed_img)
+    elastix = itk.ElastixRegistrationMethod[ImageType, ImageType].New()
+    elastix.SetFixedImage(fixed_img)
+    elastix.SetMovingImage(moving_img)
+    elastix.SetParameterObject(param_obj)
+    elastix.Update()
+
+    transform_params = elastix.GetTransformParameterObject()
+    transformix = itk.TransformixFilter[ImageType].New()
+    transformix.SetMovingImage(moving_img)
+    transformix.SetTransformParameterObject(transform_params)
+    transformix.SetComputeDeformationField(True)
+    transformix.Update()
+
+    dvf = transformix.GetOutputDeformationField()
+    itk.imwrite(dvf, str(output_path))

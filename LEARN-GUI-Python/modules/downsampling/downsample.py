@@ -2,6 +2,7 @@ import itk
 import numpy as np
 import os
 import glob
+from typing import Callable, Optional
 
 def downsample_volume(input_path, output_path, target_size=(128, 128, 128)):
     """
@@ -38,13 +39,24 @@ def downsample_volume(input_path, output_path, target_size=(128, 128, 128)):
     itk.imwrite(final_image, output_path)
     print(f"Saved downsampled volume to {output_path}")
 
-def process_directory(directory):
-    files = glob.glob(os.path.join(directory, "CT_*.mha"))
-    for f in files:
+def process_directory(
+    directory,
+    on_volume_done: Optional[Callable[[int, int, str], None]] = None,
+):
+    """
+    Downsample each CT_*.mha in directory to sub_CT_XX.mha.
+    Optional on_volume_done(done_index, total, output_basename) for GUI/workers.
+    """
+    directory = os.path.normpath(str(directory))
+    files = sorted(glob.glob(os.path.join(directory, "CT_*.mha")))
+    total = len(files)
+    for i, f in enumerate(files, start=1):
         base = os.path.basename(f)
-        # Match MATLAB name: sub_CT + end parts of name
         out_name = f"sub_CT{base[-7:]}"
-        downsample_volume(f, os.path.join(directory, out_name))
+        out_path = os.path.join(directory, out_name)
+        downsample_volume(f, out_path)
+        if on_volume_done is not None:
+            on_volume_done(i, total, out_name)
 
 if __name__ == "__main__":
     process_directory(".")

@@ -12,6 +12,7 @@ Examples:
         -> Uses given train dir
 """
 from pathlib import Path
+import re
 import sys
 
 # Add project root for imports
@@ -70,12 +71,23 @@ def main():
 
     from modules.drr_generation.generate import generate_drrs
 
-    def on_ct_done(done: int, total: int, name: str):
-        print(f"  {name} done ({done}/{total})")
+    n_ok = 0
+    for i, mha in enumerate(sub_cts, start=1):
+        m = re.search(r"(\d+)", mha.stem)
+        ct_num = int(m.group(1)) if m else i
+        ok, err = generate_drrs(
+            str(mha),
+            str(train_dir),
+            geometry_file=str(geometry_path),
+            ct_num=ct_num,
+        )
+        if not ok:
+            print(f"  FAILED {mha.name}: {err}")
+            sys.exit(1)
+        n_ok += 1
+        print(f"  OK {mha.name} ({n_ok}/{len(sub_cts)})")
 
-    generate_drrs(train_dir, geometry_path, on_ct_done=on_ct_done)
-
-    out_count = len(list(train_dir.glob("*_Proj_*.tif")))
+    out_count = len(list(train_dir.glob("*_Proj_*.bin")))
     print()
     print(f"Done. Wrote {out_count} projection files to {train_dir}")
 

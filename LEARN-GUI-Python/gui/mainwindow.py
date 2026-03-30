@@ -10,7 +10,13 @@ from .audit import AuditLog
 from .backend import WORK_ROOT
 from .ui.tabs import Tab2D
 from .ui.case_dock import CaseDock
-from .controller import MainController
+from .controller import (
+    MainController,
+    STEP_ORDER,
+    STEP_DISPLAY_NAMES,
+    VIEWER_STEP_MAP,
+    STEP_UI_INDEX,
+)
 from .preview import read_mha_volume
 
 
@@ -82,6 +88,7 @@ class MainWindow(QMainWindow):
         # Wire signals
         self.case_dock.selection_changed.connect(self.controller.on_selection)
         self.tab2d.run_pipeline_requested.connect(self.controller.start_run_pipeline)
+        self.tab2d.continue_run_requested.connect(self.controller.continue_existing_run)
         self.tab2d.rerun_step_requested.connect(self.controller.start_rerun_step)
         self.tab2d.cancel_requested.connect(lambda: self.controller.request_cancel(self))
         self.tab2d.rerun_refresh_requested.connect(self.controller._check_rerun_availability)
@@ -122,6 +129,8 @@ class MainWindow(QMainWindow):
             step_name: Human-readable step name
             viewer_type: 'ct' or 'drr'
         """
+        if step_name in {sn for _, sn, _ in self.viewer_tabs}:
+            return
         from .ui.panels import CTQuadPanel, DRRViewerPanel, DVFPanel
         from .viewer_monitors import CTViewerMonitor, DRRViewerMonitor, DVFViewerMonitor
         
@@ -152,8 +161,8 @@ class MainWindow(QMainWindow):
         elif viewer_type == 'dvf':
             new_viewer = DVFPanel(f"Step {step_index}: {step_name}")
             
-            # Determine mode ('low' or 'full')
-            is_full_res = "Full Resolution" in step_name
+            # Determine mode ('low' or 'full') — display string uses "full resolution"
+            is_full_res = "full resolution" in step_name.lower()
             mode = 'full' if is_full_res else 'low'
             
             # Clone state from main viewer
@@ -180,6 +189,66 @@ class MainWindow(QMainWindow):
         
         # Switch back to Main tab to show next step
         self.tabs.setCurrentIndex(self.main_tab_index)
+
+    def _create_viewer_tab_from_disk(self, step_index: int, step_name: str, viewer_type: str):
+        """
+        Open a CT/DRR/DVF tab by loading from train/ only (no clone from Main).
+        Used when restoring tabs after Continue/Rerun.
+        """
+        from .ui.panels import CTQuadPanel, DRRViewerPanel, DVFPanel
+        from .viewer_monitors import CTViewerMonitor, DRRViewerMonitor, DVFViewerMonitor
+
+        train_dir = self.controller._train_dir
+        if not train_dir or not train_dir.is_dir():
+            return
+
+        if viewer_type == "ct":
+            new_viewer = CTQuadPanel(f"Step {step_index}: {step_name}")
+            monitor = CTViewerMonitor(new_viewer, parent=self)
+            monitor.start(train_dir)
+            new_viewer._monitor = monitor
+        elif viewer_type == "drr":
+            new_viewer = DRRViewerPanel(f"Step {step_index}: {step_name}")
+            monitor = DRRViewerMonitor(new_viewer, parent=self)
+            monitor.start(train_dir)
+            new_viewer._monitor = monitor
+        elif viewer_type == "dvf":
+            is_full_res = "full resolution" in step_name.lower()
+            mode = "full" if is_full_res else "low"
+            new_viewer = DVFPanel(f"Step {step_index}: {step_name}")
+            monitor = DVFViewerMonitor(new_viewer, mode=mode, parent=self)
+            monitor.start(train_dir)
+            new_viewer._monitor = monitor
+        else:
+            return
+
+        tab_title = f"Step {step_index}: {step_name}"
+        new_index = self.tabs.insertTab(self.main_tab_index, new_viewer, tab_title)
+        self.main_tab_index += 1
+        self.viewer_tabs.append((new_index, step_name, new_viewer))
+        self.tabs.setCurrentIndex(self.main_tab_index)
+
+    def restore_viewer_tabs_from_completed(self, completed_steps: set):
+        """
+        Create CT, DRR, and DVF tabs for steps present in completed_steps (artifact + log),
+        skipping tabs that already exist (same display title as live pipeline tabs).
+        """
+        train_dir = self.controller._train_dir
+        if not train_dir or not train_dir.is_dir():
+            return
+        existing = {sn for _, sn, _ in self.viewer_tabs}
+        for step in STEP_ORDER:
+            if step not in completed_steps:
+                continue
+            vtype = VIEWER_STEP_MAP.get(step)
+            if vtype not in ("ct", "drr", "dvf"):
+                continue
+            disp = STEP_DISPLAY_NAMES.get(step, step)
+            if disp in existing:
+                continue
+            ui_idx = STEP_UI_INDEX.get(step, 0)
+            self._create_viewer_tab_from_disk(ui_idx + 1, disp, vtype)
+            existing.add(disp)
 
     def _clone_ct_viewer_state(self, source, dest):
         """Clone CT viewer state by reloading from disk (proper initialization)."""
@@ -250,6 +319,7 @@ class MainWindow(QMainWindow):
                     ct_data.get('angles', {}).copy()
                 )
             
+            dest.copy_view_display_settings_from(source)
             # Set the cloned viewer to the same position as the source
             if source._current_ct is not None:
                 dest._display_ct(source._current_ct)

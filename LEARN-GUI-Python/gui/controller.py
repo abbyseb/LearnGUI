@@ -6,10 +6,12 @@ Each step handles its own progress and viewer - works identically for runs/rerun
 from __future__ import annotations
 from pathlib import Path
 from typing import List, Optional
+from datetime import datetime
+from functools import partial
 import traceback
 import re # Import re module
 
-from PyQt6.QtWidgets import QMessageBox
+from PyQt6.QtWidgets import QMessageBox, QDialog
 from PyQt6.QtCore import QObject, Qt, pyqtSignal, QTimer, QUrl
 from PyQt6.QtGui import QDesktopServices
 
@@ -21,10 +23,11 @@ from .run_preparation import (
     patient_id_from_rt, centre_from_rt, selection_line,
     build_train_pairs_for_run, count_dicoms_recursive,
     validate_rerun_prerequisites, purge_step_outputs_from_train,
+    purge_train_outputs_for_steps,
     get_step_output_info, get_step_prerequisite_info,
     get_downstream_steps, check_step_prerequisites_exist
 )
-from .run_folder_manager import create_run_structure, get_run_log_file, get_train_dir
+from .run_folder_manager import create_run_structure, get_run_log_file, get_train_dir, extract_patient_id
 from .step_managers import create_step_manager
 from .viewer_monitors import create_viewer_monitor
 
@@ -93,6 +96,8 @@ class MainController(QObject):
         self._current_viewer_monitor = None
         self._active_step_name: Optional[str] = None
         self._train_dir: Optional[Path] = None
+        self._job = None  # legacy MATLAB job; _finish_err / cancel still reference it
+        self._handling_error = False
         
         # NEW: Sequential step execution
         self._step_queue: List[tuple[str, dict]] = []
@@ -207,7 +212,21 @@ class MainController(QObject):
     def _on_progress_detail(self, *args):
         """Update right-side progress details."""
         try:
-            if self._active_step_name == "COPY" and len(args) == 2:
+            if self._active_step_name == "COPY" and len(args) == 4:
+                files_done, files_total, d_arrived, d_expected = args
+                parts: list[str] = []
+                if files_total > 0:
+                    parts.append(f"{files_done}/{files_total} files")
+                elif files_done == 0 and files_total == 0:
+                    parts.append("files: …")
+                else:
+                    parts.append(f"{files_done} files")
+                if d_expected > 0:
+                    parts.append(f"{d_arrived}/{d_expected} DICOMs")
+                else:
+                    parts.append(f"{d_arrived} DICOMs")
+                self.win.tab2d.bar_info.setText(" · ".join(parts))
+            elif self._active_step_name == "COPY" and len(args) == 2:
                 copied, total = args
                 if total == 0:
                     self.win.tab2d.bar_info.setText(f"{copied} / ?")
@@ -261,8 +280,12 @@ class MainController(QObject):
         """Pops and starts the next step in the queue."""
         if not self._step_queue:
             self.log("All pipeline steps complete.", level="SUCCESS")
-            # self._finish_ok("Success") # TODO: Re-enable this when sequential is fully implemented
-            self.pipeline_completed.emit() # For now, just emit completion
+            self.win.tab2d.set_busy(False)
+            self.win.tab2d.lbl.setText("Pipeline complete.")
+            self.win.tab2d.bar.setRange(0, 100)
+            self.win.tab2d.bar.setValue(100)
+            self.pipeline_completed.emit()
+            self._check_rerun_availability()
             return
             
         step_name, kwargs = self._step_queue.pop(0)
@@ -283,13 +306,15 @@ class MainController(QObject):
             self.step_viewer_completed.emit(idx + 1, display_name, viewer_type)
 
         self._check_rerun_availability()
-        
-        # FIX: Delay the "Step complete" log message to allow MATLAB's final
-        # output to appear first, ensuring correct chronological order.
-        QTimer.singleShot(750, lambda: (
-            self.log(f"Step complete: {step_name}"),
-            self._activate_next_step() # Call the new sequential activation
-        ))
+
+        # Delay before next step (log ordering); partial() binds step_name safely.
+        QTimer.singleShot(750, partial(self._log_step_done_and_continue, step_name))
+
+    def _log_step_done_and_continue(self, step_name: str) -> None:
+        if self._ui_frozen:
+            return
+        self.log(f"Step complete: {step_name}")
+        self._activate_next_step()
     
     def _switch_viewer(self, viewer_type: str):
         """Activate appropriate viewer and its monitor."""
@@ -332,6 +357,55 @@ class MainController(QObject):
         self.win.tab2d.bar.setValue(0)
         self.win.tab2d.lbl.setText(f"{display}...")
     
+    def _build_step_queue_from_ui_flags(
+        self,
+        *,
+        skip_copy: bool,
+        skip_dicom2mha: bool,
+        skip_downsample: bool,
+        skip_drr: bool,
+        skip_compress: bool,
+        skip_2d_dvf: bool,
+        do_3d_low: bool,
+        do_3d_full: bool,
+        skip_kv_preprocess: bool,
+        copy_extra: dict | None,
+    ) -> List[tuple[str, dict]]:
+        q: List[tuple[str, dict]] = []
+        if not skip_copy:
+            if copy_extra is None:
+                raise ValueError("Internal error: COPY enabled without copy parameters.")
+            q.append(("COPY", copy_extra))
+        if not skip_dicom2mha:
+            q.append(("DICOM2MHA", {}))
+        if not skip_downsample:
+            q.append(("DOWNSAMPLE", {}))
+        if not skip_drr:
+            drr_opts = self.win.tab2d.get_drr_generation_options()
+            q.append(
+                (
+                    "DRR",
+                    {
+                        "geom_path": drr_opts.get("geometry_path"),
+                        "drr_opts": drr_opts,
+                    },
+                )
+            )
+        if not skip_compress:
+            q.append(("COMPRESS", {}))
+        if not skip_2d_dvf:
+            q.append(("DVF2D", {}))
+        if do_3d_low:
+            q.append(("DVF3D_LOW", {}))
+        if do_3d_full:
+            q.append(("DVF3D_FULL", {}))
+        if not skip_kv_preprocess:
+            q.append(("KV_PREPROCESS", {
+                "rt_ct_pres_list": self._last_rt_list,
+                "base_dir": backend.BASE_DIR,
+            }))
+        return q
+
     # ========================================================================
     # NORMAL PIPELINE RUN
     # ========================================================================
@@ -418,53 +492,26 @@ class MainController(QObject):
                 'src_base': str(backend.BASE_DIR),
                 'dst_base': str(self.current_run_folder)
             }
-            self._step_queue = []
-            
-            # 1. COPY
-            if not skip_copy:
-                src_base = backend.BASE_DIR
-                dst_base = self.current_run_folder
-                total_dicoms = sum(count_dicoms_recursive(src) for src, _ in pairs)
-                self._step_queue.append(("COPY", {
-                    'total_dicoms': total_dicoms,
-                    'patient_id': patient_id,
-                    'rt_list': rt_list,
-                    'src_base': str(src_base),
-                    'dst_base': str(dst_base)
-                }))
-            
-            # 2. DICOM2MHA
-            if not skip_dicom2mha:
-                self._step_queue.append(("DICOM2MHA", {}))
-                
-            # 3. DOWNSAMPLE
-            if not skip_downsample:
-                self._step_queue.append(("DOWNSAMPLE", {}))
-                
-            # 4. DRR
-            if not skip_drr:
-                self._step_queue.append(("DRR", {}))
-                
-            # 5. COMPRESS
-            if not skip_compress:
-                self._step_queue.append(("COMPRESS", {}))
-                
-            # 6. DVF2D
-            if not skip_2d_dvf:
-                self._step_queue.append(("DVF2D", {}))
-                
-            # 7. DVF3D (Low and Full can both be selected)
-            if do_3d_low:
-                self._step_queue.append(("DVF3D_LOW", {}))
-            if do_3d_full:
-                self._step_queue.append(("DVF3D_FULL", {}))
-                
-            # 8. KV_PREPROCESS
-            if not skip_kv_preprocess:
-                self._step_queue.append(("KV_PREPROCESS", {
-                    'rt_ct_pres_list': self._last_rt_list,
-                    'base_dir': backend.BASE_DIR
-                }))
+            total_dicoms = sum(count_dicoms_recursive(src) for src, _ in pairs)
+            copy_extra = {
+                "total_dicoms": total_dicoms,
+                "patient_id": patient_id,
+                "rt_list": rt_list,
+                "src_base": str(backend.BASE_DIR),
+                "dst_base": str(self.current_run_folder),
+            }
+            self._step_queue = self._build_step_queue_from_ui_flags(
+                skip_copy=skip_copy,
+                skip_dicom2mha=skip_dicom2mha,
+                skip_downsample=skip_downsample,
+                skip_drr=skip_drr,
+                skip_compress=skip_compress,
+                skip_2d_dvf=skip_2d_dvf,
+                do_3d_low=do_3d_low,
+                do_3d_full=do_3d_full,
+                skip_kv_preprocess=skip_kv_preprocess,
+                copy_extra=copy_extra if not skip_copy else None,
+            )
 
             # Start the first step
             self._activate_next_step()
@@ -578,6 +625,248 @@ class MainController(QObject):
                 "Start a pipeline run first."
             )
 
+    def continue_existing_run(self):
+        """Attach session to an existing run folder and log (Continue run… dialog)."""
+        from .ui.attach_run_dialog import AttachRunDialog
+
+        dlg = AttachRunDialog(self.win, work_root=self.work_root)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        run_folder = dlg.run_folder.expanduser().resolve()
+        if not run_folder.is_dir():
+            QMessageBox.warning(
+                self.win,
+                "Run folder",
+                f"Not a directory:\n{run_folder}",
+            )
+            return
+
+        train_dir = get_train_dir(run_folder)
+        custom = dlg.custom_log_file
+        if custom:
+            log_path = custom.expanduser().resolve()
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            if not log_path.exists():
+                log_path.touch()
+            self.audit.set_log_file(log_path, append=True)
+        else:
+            log_path = get_run_log_file(run_folder)
+            if log_path is not None and log_path.exists():
+                self.audit.set_log_file(log_path, append=True)
+            else:
+                logs_dir = self.work_root / "logs" / run_folder.name
+                logs_dir.mkdir(parents=True, exist_ok=True)
+                log_path = logs_dir / f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+                log_path.touch()
+                self.audit.set_log_file(log_path, append=False)
+
+        self.current_run_folder = run_folder
+        self.current_run_log = log_path
+        self._train_dir = train_dir if train_dir.exists() else None
+
+        self._session_active = True
+        self.win.tab2d.activate_session()
+        self.win.tab2d.btn_open_log.setEnabled(True)
+
+        self.audit.add_raw("\n--- Continue run: attached workspace ---\n")
+        self.log(f"Run folder: {run_folder}", level="INFO")
+        self.log(f"Run log: {log_path}", level="INFO")
+        if self._train_dir:
+            self.log(f"Train directory: {self._train_dir}", level="INFO")
+        else:
+            self.log(
+                f"Train directory missing (expected under run folder): {train_dir}",
+                level="WARN",
+            )
+
+        hist = dlg.optional_history_log
+        if hist:
+            hp = hist.expanduser().resolve()
+            if hp.is_file():
+                self._replay_viewer_tabs_from_history(hp)
+            elif str(hist).strip():
+                QMessageBox.warning(
+                    self.win,
+                    "History log",
+                    f"File not found:\n{hp}",
+                )
+
+        if dlg.launch_pipeline_after_attach():
+            flags = dlg.pipeline_step_flags()
+            self._start_continue_pipeline(
+                run_folder,
+                train_dir,
+                flags,
+                dlg.purge_downstream_outputs(),
+            )
+        else:
+            self._check_rerun_availability()
+
+    def _start_continue_pipeline(
+        self,
+        run_folder: Path,
+        train_dir: Path,
+        step_flags: list[bool],
+        purge_downstream: bool,
+    ) -> None:
+        """After Continue attach: optionally purge from first selected step onward and run the selected queue."""
+        n = len(STEP_ORDER)
+        if len(step_flags) < n:
+            QMessageBox.critical(self.win, "Pipeline", "Invalid step selection (internal).")
+            return
+        first_i = None
+        for i in range(n):
+            if step_flags[i]:
+                first_i = i
+                break
+        if first_i is None:
+            return
+
+        skip_copy = not step_flags[0]
+        skip_dicom2mha = not step_flags[1]
+        skip_downsample = not step_flags[2]
+        skip_drr = not step_flags[3]
+        skip_compress = not step_flags[4]
+        skip_2d_dvf = not step_flags[5]
+        do_3d_low = step_flags[6]
+        do_3d_full = step_flags[7]
+        skip_kv_preprocess = not step_flags[8]
+
+        first_step = STEP_ORDER[first_i]
+        patient_root = train_dir.parent
+        pairs = [(Path(), train_dir)]
+
+        ok, err_msg = validate_rerun_prerequisites(pairs, patient_root, first_step, self.audit)
+        if not ok:
+            QMessageBox.critical(self.win, "Validation Failed", f"{err_msg}\n\nSee log for details.")
+            self._check_rerun_availability()
+            return
+
+        if purge_downstream:
+            to_purge = STEP_ORDER[first_i:]
+            deleted = purge_train_outputs_for_steps(train_dir, to_purge, self.work_root, self.audit)
+            self.log(
+                f"Purged {deleted} file(s) in train/ for steps {first_step} … {STEP_ORDER[-1]}.",
+                level="INFO",
+            )
+
+        trial = self.win.case_dock.current_trial()
+        centre = self.win.case_dock.current_centre()
+        rt_list = list(self._last_rt_list)
+        if self.selected_ids:
+            try:
+                resolved = backend.resolve_rt_ct_pres(trial, centre, self.selected_ids)
+                if resolved:
+                    rt_list = resolved
+                    self._last_rt_list = rt_list[:]
+            except Exception as e:
+                self.log(f"Could not refresh prescriptions (using session list if any): {e}", level="WARN")
+
+        if not skip_copy and not rt_list:
+            QMessageBox.critical(
+                self.win,
+                "COPY needs prescriptions",
+                "COPY is selected but no prescriptions are loaded. Select the patient(s) for this run in the "
+                "Case dock (same as for a normal pipeline), then use Continue run again.",
+            )
+            self._check_rerun_availability()
+            return
+
+        if not skip_kv_preprocess and not self._last_rt_list:
+            self.log(
+                "KV_PREPROCESS skipped: no prescriptions in session. Select patients in the Case dock and "
+                "continue again if you need kV processing.",
+                level="WARN",
+            )
+            skip_kv_preprocess = True
+
+        patient_id = (
+            patient_id_from_rt(rt_list[0], trial) if rt_list else extract_patient_id(run_folder.name)
+        )
+
+        if rt_list:
+            bpairs = build_train_pairs_for_run(rt_list, run_folder, backend.BASE_DIR)
+            if bpairs:
+                self._train_dir = bpairs[0][1]
+            else:
+                self._train_dir = train_dir
+        else:
+            self._train_dir = train_dir
+
+        self._run_params = {
+            "patient_id": patient_id,
+            "rt_list": rt_list,
+            "src_base": str(backend.BASE_DIR),
+            "dst_base": str(run_folder),
+        }
+
+        copy_extra = None
+        if not skip_copy:
+            pairs_for_counting = build_train_pairs_for_run(rt_list, run_folder, backend.BASE_DIR)
+            total_dicoms = sum(count_dicoms_recursive(src) for src, _ in pairs_for_counting)
+            copy_extra = {
+                "total_dicoms": total_dicoms,
+                "patient_id": patient_id,
+                "rt_list": rt_list,
+                "src_base": str(backend.BASE_DIR),
+                "dst_base": str(run_folder),
+            }
+
+        self._is_rerun_mode = False
+        self.audit.add_raw("\n--- Continue run: starting selected pipeline steps ---\n")
+        self.log(
+            f"Continue pipeline starting at {first_step} (purge downstream: {purge_downstream}).",
+            level="INFO",
+        )
+
+        try:
+            self._step_queue = self._build_step_queue_from_ui_flags(
+                skip_copy=skip_copy,
+                skip_dicom2mha=skip_dicom2mha,
+                skip_downsample=skip_downsample,
+                skip_drr=skip_drr,
+                skip_compress=skip_compress,
+                skip_2d_dvf=skip_2d_dvf,
+                do_3d_low=do_3d_low,
+                do_3d_full=do_3d_full,
+                skip_kv_preprocess=skip_kv_preprocess,
+                copy_extra=copy_extra,
+            )
+        except ValueError as e:
+            QMessageBox.critical(self.win, "Pipeline", str(e))
+            self._check_rerun_availability()
+            return
+
+        if not self._step_queue:
+            self.log("No steps queued after Continue (nothing to run).", level="WARN")
+            self._check_rerun_availability()
+            return
+
+        self.win.tab2d.set_busy(True)
+        self.win.tab2d.blank_all_viewers()
+        self.win.tab2d.reset_all_steps(from_index=first_i)
+        self._activate_next_step()
+
+    def _replay_viewer_tabs_from_history(self, hist_path: Path) -> None:
+        """Recreate CT/DRR/DVF viewer tabs from 'Step complete: STEP' lines in a saved log."""
+        try:
+            text = hist_path.read_text(encoding="utf-8", errors="replace")
+        except OSError as e:
+            self.log(f"Could not read history log: {e}", level="WARN")
+            return
+        completed = set(m.group(1) for m in re.finditer(r"Step complete:\s*([A-Z0-9_]+)", text))
+        if not completed:
+            return
+        for i, step_name in enumerate(STEP_ORDER):
+            if step_name not in completed:
+                continue
+            viewer_type = VIEWER_STEP_MAP.get(step_name)
+            if not viewer_type or viewer_type == "preparing":
+                continue
+            display_name = STEP_DISPLAY_NAMES.get(step_name, step_name)
+            self.step_viewer_completed.emit(i + 1, display_name, viewer_type)
+
     # ========================================================================
     # RERUN STEP
     # ========================================================================
@@ -628,27 +917,37 @@ class MainController(QObject):
         
         step_kwargs = {}
         if step.upper() == "COPY":
-            # --- FIX: Calculate total_dicoms from original source for rerun ---
+            # CopyWorker needs the same routing as a full run (parallel copy into train/).
             if not self._last_rt_list:
-                self.log("Rerun COPY: Cannot find original rt_list to count DICOMs.", level="ERROR")
-                step_kwargs['total_dicoms'] = 0
+                self.log("Rerun COPY: No saved prescription list — copy may be incomplete.", level="WARN")
+                step_kwargs["rt_list"] = []
             else:
-                # Re-build the source paths just for counting
+                step_kwargs["rt_list"] = self._last_rt_list[:]
+                trial = self.win.case_dock.current_trial()
+                step_kwargs["patient_id"] = patient_id_from_rt(self._last_rt_list[0], trial)
+            step_kwargs["src_base"] = str(backend.BASE_DIR)
+            step_kwargs["dst_base"] = str(self.current_run_folder)
+            if not self._last_rt_list:
+                step_kwargs["total_dicoms"] = 0
+            else:
                 pairs_for_counting = build_train_pairs_for_run(
-                    self._last_rt_list, 
-                    self.current_run_folder, 
-                    backend.BASE_DIR
+                    self._last_rt_list,
+                    self.current_run_folder,
+                    backend.BASE_DIR,
                 )
-
                 self.log("Rerun COPY: Counting DICOMs from original source...")
                 total_dicoms = sum(count_dicoms_recursive(src) for src, _ in pairs_for_counting)
-                step_kwargs['total_dicoms'] = total_dicoms
+                step_kwargs["total_dicoms"] = total_dicoms
                 self.log(f"Found {total_dicoms} DICOMs for copy progress.")
-            # --- END FIX ---
 
         elif step.upper() == "KV_PREPROCESS":
             step_kwargs['rt_ct_pres_list'] = self._last_rt_list
             step_kwargs['base_dir'] = backend.BASE_DIR
+
+        elif step.upper() == "DRR":
+            drr_opts = self.win.tab2d.get_drr_generation_options()
+            step_kwargs["geom_path"] = drr_opts.get("geometry_path")
+            step_kwargs["drr_opts"] = drr_opts
 
         
         self._activate_step(step.upper(), **step_kwargs)
@@ -697,14 +996,14 @@ class MainController(QObject):
         availability = {}
         steps_to_check = {
             "Copy training files": "COPY",
-            "DICOM → MHA": "DICOM2MHA", 
+            "DICOM → MHA": "DICOM2MHA",
             "Downsample volumes": "DOWNSAMPLE",
-            "Generate DRRs": "DRR", 
-            "Compress DRRs": "COMPRESS", 
+            "Generate DRRs": "DRR",
+            "Compress DRRs": "COMPRESS",
             "2D DVFs": "DVF2D",
             "3D DVFs (Downsampled)": "DVF3D_LOW",
             "3D DVFs (Full Resolution)": "DVF3D_FULL",
-            "Finalize & Process kV": "KVPREPROCESS",
+            "kV TIFF → BIN": "KV_PREPROCESS",
         }
         for display_name, step_key in steps_to_check.items():
             can_run, reason = check_step_prerequisites_exist(train_dir, patient_root, step_key)

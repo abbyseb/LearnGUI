@@ -12,19 +12,13 @@ Works identically for normal runs and reruns.
 from __future__ import annotations
 from pathlib import Path
 from typing import Optional, List
+from PyQt6.QtCore import QObject, pyqtSignal, QTimer
+import time
 import re
-from PyQt6.QtCore import pyqtSignal, QObject, QTimer
-from .workers import (
-    CopyWorker, Dicom2MhaWorker, DownsampleWorker, 
-    DrrWorker, CompressWorker, DvfWorker, KvPreprocessWorker,
-    Dvf2dWorker
-)
 
 def get_projections_per_ct() -> int:
-    """Read projection count from RTKGeometry.xml or return default 120."""
+    """Read projection count from modules/drr_generation/RTKGeometry_360.xml or default 120."""
     try:
-        # relative to LEARN-GUI-Python/gui/step_managers.py
-        # root is ../ (LEARN-GUI-Python)
         root = Path(__file__).resolve().parents[1]
         geom_path = root / "modules" / "drr_generation" / "RTKGeometry_360.xml"
         if geom_path.exists():
@@ -61,10 +55,9 @@ class StepManager(QObject):
         self._timer.timeout.connect(self._poll)
         self._last_progress = -1
         self._completion_checks = 0
-        self.worker = None
         
     def start(self, train_dir: Path):
-        """Activate this step's monitoring and optionally its worker."""
+        """Activate this step's monitoring."""
         self.train_dir = Path(train_dir)
         self.is_active = True
         self._last_progress = -1
@@ -75,34 +68,17 @@ class StepManager(QObject):
         if viewer:
             self.activate_viewer.emit(viewer)
         
-        # Instantiate specialized worker if one is defined for this step
-        self._start_worker()
-        
-        # Standardize worker signal handling if a worker was created
-        if self.worker:
-            self.worker.finished_ok.connect(self._on_worker_finished)
-            self.worker.failed.connect(self._on_worker_failed)
-            # Start the worker thread AFTER connecting signals
-            self.worker.start()
-        
-        # Start polling (for UI progress feedback)
+        # Start polling
         interval = self.get_poll_interval_ms()
         self._timer.start(interval)
         
         # Immediate first poll
         self._poll()
     
-    def _start_worker(self):
-        """Override in subclasses to start a QThread worker."""
-        pass
-
     def stop(self):
-        """Deactivate monitoring and stop worker."""
+        """Deactivate monitoring."""
         self.is_active = False
         self._timer.stop()
-        if self.worker and self.worker.isRunning():
-            self.worker.terminate() # Or safer cancellation if implemented
-            self.worker.wait()
     
     def _poll(self):
         """Poll train directory and emit progress."""
@@ -148,73 +124,255 @@ class StepManager(QObject):
         raise NotImplementedError
     
     def is_complete(self, created: int, total: int) -> bool:
-        """Check if step is logically done."""
-        if total <= 0:
-            return True
-        return created >= total
+        """Check if step is done."""
+        return total > 0 and created >= total
 
-    def _on_worker_finished(self, msg: str):
-        """Standard handler for worker success."""
-        if self.is_active:
-            # Force one last poll to ensure 100% UI
-            self._poll()
-            self.stop()
-            self.step_complete.emit()
 
-    def _on_worker_failed(self, error: str):
-        """Standard handler for worker failure."""
-        if self.is_active:
-            self.stop()
-            # Most steps will pass the error up via signals if needed, 
-            # but simple manager stop is the baseline.
-            # (In MainController, we rely on the specific manager signals or worker signals)
+class WorkerBackedStepManager(StepManager):
+    """
+    Runs the real work in a QThread worker (see workers.py). Polling only refreshes
+    the progress bar; step completion is signaled when the worker emits finished_ok.
+    """
+
+    _step_key: str = "STEP"
+    _status_when_done_text: str = "Complete."
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._worker = None
+
+    def _poll(self):
+        if not self.is_active or not self.train_dir:
+            return
+        try:
+            created, total, pct = self.calculate_progress()
+            status = self.format_status(created, total)
+            if pct != self._last_progress:
+                self.progress_updated.emit(pct, status)
+                self._last_progress = pct
+        except Exception as e:
+            print(f"Poll error in {self.__class__.__name__}: {e}")
+
+    def start(self, train_dir: Path):
+        super().start(train_dir)
+        self._start_worker()
+
+    def _create_worker(self):
+        raise NotImplementedError
+
+    def _start_worker(self):
+        w = self._create_worker()
+        if w is None:
+            return
+        self._worker = w
+        w.line_received.connect(self._on_worker_log)
+        w.finished_ok.connect(self._on_worker_finished)
+        w.failed.connect(self._on_worker_failed)
+        w.start()
+
+    def _on_worker_log(self, msg: str) -> None:
+        c = self.parent()
+        if c and hasattr(c, "log"):
+            c.log(msg)
+
+    def _on_worker_finished(self, _name: str) -> None:
+        if not self.is_active:
+            return
+        self._detach_worker()
+        self.is_active = False
+        self._timer.stop()
+        self.progress_updated.emit(100, self._status_when_done_text)
+        self.step_complete.emit()
+
+    def _on_worker_failed(self, err: str) -> None:
+        self._detach_worker()
+        c = self.parent()
+        if c and hasattr(c, "_finish_err"):
+            c._finish_err(f"{self._step_key}: {err}")
+        else:
+            print(f"{self._step_key} failed: {err}")
+
+    def _detach_worker(self) -> None:
+        w = self._worker
+        if not w:
+            return
+        for sig, slot in (
+            (w.line_received, self._on_worker_log),
+            (w.finished_ok, self._on_worker_finished),
+            (w.failed, self._on_worker_failed),
+        ):
+            try:
+                sig.disconnect(slot)
+            except TypeError:
+                pass
+        self._worker = None
+        w.deleteLater()
+
+    def stop(self):
+        w = getattr(self, "_worker", None)
+        if w is not None:
+            if w.isRunning():
+                w.cancel()
+                w.wait(8000)
+            self._detach_worker()
+        super().stop()
 
 
 class CopyStepManager(StepManager):
-    """Monitors DICOM file copying with efficient DICOM preview."""
+    """Runs parallel file copy (CopyWorker) and DICOM preview while COPY is active."""
     
-    progress_detail = pyqtSignal(int, int)  # copied, total (for right label)
+    # files_done, files_total, dicom_arrived, dicom_expected (from prescription count)
+    progress_detail = pyqtSignal(int, int, int, int)
     
-    def __init__(self, total_dicoms: int, parent=None):
+    def __init__(
+        self,
+        total_dicoms: int,
+        patient_id: str = "",
+        rt_list: Optional[List] = None,
+        src_base: str = "",
+        dst_base: Path | str = "",
+        parent=None,
+    ):
         super().__init__(parent)
-        self.total_dicoms = total_dicoms
+        self.total_dicoms = int(total_dicoms)
+        self.patient_id = patient_id or ""
+        self.rt_list = list(rt_list or [])
+        self.src_base = str(src_base or "")
+        self.dst_base = Path(dst_base) if dst_base else Path()
         self.baseline_count = 0
+        self._files_done = 0
+        self._files_total = 0
+        self._last_copy_ft_reported = -2  # sentinel: first emit after start
         self._preview_engine = None
+        self._copy_worker = None
     
     def start(self, train_dir: Path):
-        # Record baseline before starting
-        self.baseline_count = self._count_dicoms(train_dir)
-        super().start(train_dir)
-    
-    def _start_worker(self):
-        """Start the Python copy worker directly."""
-        controller = self.parent()
-        if not controller or not hasattr(controller, "run_params"):
+        c = self.parent()
+        if not self.rt_list or not self.dst_base or not self.src_base:
+            msg = "COPY: missing rt_list, dst_base, or src_base — cannot copy."
+            if c and hasattr(c, "log"):
+                c.log(msg, level="ERROR")
+            if c and hasattr(c, "_finish_err"):
+                c._finish_err(msg)
             return
-            
-        # Get params from controller (where user selection is stored)
-        params = controller._run_params # Accessing controller's state
-        self.worker = CopyWorker(
-            params['patient_id'],
-            params['rt_list'],
-            params['src_base'],
-            params['dst_base']
-        )
-        
-        # Connect preview signal directly to our handler
-        self.worker.preview_frame_ready.connect(self._on_push_preview)
-        
-        # DO NOT call self.worker.start() here; base class handles it
+        self.baseline_count = self._count_dicoms(train_dir)
+        self._files_done = 0
+        self._files_total = 0
+        self._last_copy_ft_reported = -2
+        super().start(train_dir)
+        self._start_copy_worker()
+        self._start_dicom_preview()
     
-    def stop(self):
-        super().stop()
-        # Decommissioned engine cleanup (for safety)
-        if hasattr(self, '_preview_engine') and self._preview_engine:
+    def _disconnect_copy_worker(self) -> None:
+        w = self._copy_worker
+        if not w:
+            return
+        for sig, slot in (
+            (w.line_received, self._on_copy_log_line),
+            (w.file_progress, self._on_copy_file_progress),
+            (w.finished_ok, self._on_copy_worker_finished),
+            (w.failed, self._on_copy_worker_failed),
+        ):
+            try:
+                sig.disconnect(slot)
+            except TypeError:
+                pass
+        self._copy_worker = None
+        w.deleteLater()
+
+    def _stop_copy_worker_if_running(self) -> None:
+        w = self._copy_worker
+        if not w:
+            return
+        if w.isRunning():
+            w.cancel()
+            w.wait(8000)
+        self._disconnect_copy_worker()
+
+    def _cleanup_dicom_preview_ui(self) -> None:
+        controller = self.parent()
+        if hasattr(controller, "win"):
+            viewer = controller.win.tab2d.ct_quad
+            if hasattr(viewer, "info_panel"):
+                try:
+                    viewer.info_panel.dicom_preview_series_uid_changed.disconnect(
+                        self._on_copy_preview_series_uid
+                    )
+                except TypeError:
+                    pass
+                viewer.info_panel.clear_dicom_preview_series()
+                from .ui.info_panels import CTInfoWidget
+
+                if isinstance(viewer.info_panel, CTInfoWidget):
+                    viewer.info_panel.set_preview_mode(False)
+        if self._preview_engine:
+            try:
+                self._preview_engine.series_catalog_changed.disconnect(
+                    self._on_copy_series_catalog
+                )
+            except TypeError:
+                pass
             try:
                 self._preview_engine.stop()
             except Exception:
                 pass
             self._preview_engine = None
+
+    def stop(self):
+        self._stop_copy_worker_if_running()
+        super().stop()
+        self._cleanup_dicom_preview_ui()
+
+    def _on_copy_log_line(self, msg: str) -> None:
+        c = self.parent()
+        if c and hasattr(c, "log"):
+            c.log(msg)
+
+    def _on_copy_file_progress(self, done: int, total: int) -> None:
+        self._files_done = int(done)
+        self._files_total = int(total)
+        self._emit_copy_progress_ui()
+
+    def _emit_copy_progress_ui(self) -> None:
+        """Progress bar follows all files; detail line shows files + DICOMs on disk."""
+        if not self.train_dir:
+            return
+        d_arrived = max(0, self._count_dicoms(self.train_dir) - self.baseline_count)
+        d_exp = max(0, self.total_dicoms)
+        fd, ft = self._files_done, self._files_total
+        self.progress_detail.emit(fd, ft, d_arrived, d_exp)
+        if ft > 0:
+            pct = int(min(99, (fd / ft) * 100))
+            if fd >= ft:
+                status = "Copying training files (all files written; finishing)…"
+            else:
+                status = "Copying training files…"
+        else:
+            pct = 0
+            status = "Preparing file copy list…"
+        ft_changed = self._last_copy_ft_reported != ft
+        if pct != self._last_progress or ft_changed:
+            self.progress_updated.emit(pct, status)
+            self._last_progress = pct
+            self._last_copy_ft_reported = ft
+
+    def _on_copy_worker_finished(self, _name: str) -> None:
+        if not self.is_active:
+            return
+        self._stop_copy_worker_if_running()
+        self.is_active = False
+        self._timer.stop()
+        self._cleanup_dicom_preview_ui()
+        self.progress_updated.emit(100, "Copy complete.")
+        self.step_complete.emit()
+
+    def _on_copy_worker_failed(self, err: str) -> None:
+        self._stop_copy_worker_if_running()
+        c = self.parent()
+        if c and hasattr(c, "_finish_err"):
+            c._finish_err(f"COPY: {err}")
+        else:
+            print(f"COPY failed: {err}")
     
     def get_viewer_type(self) -> Optional[str]:
         # Return None to prevent the main controller from switching the viewer.
@@ -222,35 +380,40 @@ class CopyStepManager(StepManager):
         return None
     
     def calculate_progress(self) -> tuple[int, int, int]:
-        current = self._count_dicoms(self.train_dir)
-        copied = max(0, current - self.baseline_count)
-        total = self.total_dicoms
-        pct = int(min(100, (copied / total * 100))) if total > 0 else 0
-        
-        # Emit detail signal for right-side label
-        self.progress_detail.emit(copied, total)
-        
-        return copied, total, pct
-    
-    def format_status(self, created: int, total: int) -> str:
-        return "Copying training files..."
-    
-    def _on_push_preview(self, pix: object, info: dict):
-        """Handle preview frames pushed from the worker."""
-        try:
-            controller = self.parent()
-            if not hasattr(controller, "win"): return
-            viewer = controller.win.tab2d.ct_quad
-            
-            # Update viewer
-            from PyQt6.QtGui import QPixmap
-            if isinstance(pix, QPixmap) and not pix.isNull():
-                viewer.set_axial_pixmap(pix)
-            if info:
-                viewer.set_info_dict(info)
-        except Exception:
-            pass
+        """Satisfy StepManager API; bar is driven by _emit_copy_progress_ui (file counts)."""
+        fd, ft = self._files_done, self._files_total
+        pct = int(min(99, (fd / ft) * 100)) if ft > 0 else 0
+        return fd, ft, pct
 
+    def format_status(self, created: int, total: int) -> str:
+        return "Copying training files…"
+
+    def _poll(self):
+        """Refresh DICOM arrival counts while the worker streams file_progress."""
+        if not self.is_active or not self.train_dir:
+            return
+        try:
+            self._emit_copy_progress_ui()
+        except Exception as e:
+            print(f"Poll error in {self.__class__.__name__}: {e}")
+
+    def _start_copy_worker(self) -> None:
+        """Parallel copy into train/ (ThreadPoolExecutor in CopyWorker)."""
+        from .workers import CopyWorker
+
+        self._copy_worker = CopyWorker(
+            patient_id=self.patient_id,
+            rt_list=self.rt_list,
+            src_base=self.src_base,
+            dst_base=self.dst_base,
+            parent=self,
+        )
+        self._copy_worker.line_received.connect(self._on_copy_log_line)
+        self._copy_worker.file_progress.connect(self._on_copy_file_progress)
+        self._copy_worker.finished_ok.connect(self._on_copy_worker_finished)
+        self._copy_worker.failed.connect(self._on_copy_worker_failed)
+        self._copy_worker.start()
+    
     def _start_dicom_preview(self):
         """Start efficient DICOM preview engine."""
         try:
@@ -263,26 +426,26 @@ class CopyStepManager(StepManager):
                 return
             
             viewer = controller.win.tab2d.ct_quad
-            
-            # Enable Preview Mode (Hide complex controls)
-            if hasattr(viewer, 'info_panel') and isinstance(viewer.info_panel, CTInfoWidget):
-                viewer.info_panel.set_preview_mode(True)
-            
-            # Create efficient preview engine
+
+            if not (
+                hasattr(viewer, "info_panel")
+                and isinstance(viewer.info_panel, CTInfoWidget)
+            ):
+                return
+
+            viewer.info_panel.set_preview_mode(True)
+
             self._preview_engine = DICOMPreviewEngine(
                 self.train_dir,
-                display_fps=8,  # Slightly faster for smoother carousel
-                discovery_interval_ms=300,  # Less frequent to save CPU
-                logger=controller.log,  # Pass controller's logger
+                display_fps=5,  # Smooth 5 FPS
+                discovery_interval_ms=150,  # Check for new files frequently
                 parent=self
             )
-            
-            # Check pydicom availability immediately
-            import pydicom
-            if pydicom is None:
-                controller.log("ERROR: pydicom not found! DICOM preview will be disabled.", level="ERROR")
-            else:
-                controller.log("DICOM preview engine initialized.", level="DEBUG")
+
+            viewer.info_panel.dicom_preview_series_uid_changed.connect(
+                self._on_copy_preview_series_uid
+            )
+            self._preview_engine.series_catalog_changed.connect(self._on_copy_series_catalog)
             
             # Connect to viewer updates (only axial visible in single/preview mode)
             def update_preview(pix_ax, pix_co, pix_sa, info):
@@ -301,53 +464,60 @@ class CopyStepManager(StepManager):
             print(f"DICOM preview engine failed: {e}")
             import traceback
             traceback.print_exc()
+
+    def _on_copy_preview_series_uid(self, uid: str) -> None:
+        if self._preview_engine:
+            self._preview_engine.set_active_series_uid(uid)
+
+    def _on_copy_series_catalog(self, opts: list) -> None:
+        controller = self.parent()
+        if not hasattr(controller, "win"):
+            return
+        viewer = controller.win.tab2d.ct_quad
+        if hasattr(viewer, "info_panel"):
+            viewer.info_panel.update_dicom_preview_series(list(opts))
     
     @staticmethod
     def _count_dicoms(path: Path) -> int:
-        """Count DICOM files recursively, including extensionless ones."""
-        if not path or not path.exists():
+        """Count DICOM files recursively. Must match count_dicoms_recursive logic."""
+        if not path.exists():
             return 0
         count = 0
         for p in path.rglob("*"):
-            if p.is_file():
-                ext = p.suffix.lower()
-                if ext in {".dcm", ".dicom", ".ima"}:
-                    count += 1
-                elif ext == "":
-                    # Check for DICM magic bytes at offset 128
-                    try:
-                        with open(p, "rb") as fh:
-                            fh.seek(128)
-                            if fh.read(4) == b"DICM":
-                                count += 1
-                    except Exception:
-                        pass
+            if not p.is_file():
+                continue
+            ext = p.suffix.lower()
+            if ext in {".dcm", ".dicom", ".ima"}:
+                count += 1
+            elif ext == "" or ext not in (".txt", ".mha", ".mhd", ".xml", ".json"):
+                try:
+                    with open(p, "rb") as fh:
+                        fh.seek(128)
+                        if fh.read(4) == b"DICM":
+                            count += 1
+                except Exception:
+                    pass
         return count
 
 
+class DICOM2MHAStepManager(WorkerBackedStepManager):
+    """DICOM → MHA via Dicom2MhaWorker; poll reflects CT_*.mha growth."""
 
-class DICOM2MHAStepManager(StepManager):
-    """Monitors DICOM → MHA conversion."""
-    
+    _step_key = "DICOM2MHA"
+    _status_when_done_text = "DICOM → MHA complete."
+
     progress_detail = pyqtSignal(int, int, int, int)  # ct_done, ct_total, struct_done, struct_total
-    
+
+    def _create_worker(self):
+        from .workers import Dicom2MhaWorker
+
+        return Dicom2MhaWorker(self.train_dir, parent=self)
+
     def get_viewer_type(self) -> Optional[str]:
         return 'ct'
     
     def get_poll_interval_ms(self) -> int:
         return 500  # MHA files are large, slower polling is fine
-    
-    def _start_worker(self):
-        """Start the Python DICOM2MHA worker directly."""
-        if not self.train_dir: return
-        
-        # dicom_src is train_dir (where COPY put them)
-        dicom_src = self.train_dir
-        # sample_path is just used as a base for directory resolving in worker
-        sample_path = str(self.train_dir / "CT_01.mha")
-        
-        self.worker = Dicom2MhaWorker(str(dicom_src), sample_path)
-        # self.worker.start() -> removed, base class handles it
     
     def calculate_progress(self) -> tuple[int, int, int]:
         if not self.train_dir or not self.train_dir.exists():
@@ -359,7 +529,7 @@ class DICOM2MHAStepManager(StepManager):
         struct_found = [n for n in struct_names if (self.train_dir / n).exists()]
         struct_created = len(struct_found)
         
-        # Try to get expected count from SeriesInfo.txt
+        # Try to get expected count from SeriesInfo.txt (written at start of conversion)
         ct_expected = self._read_expected_ct_count()
         if ct_expected is None:
             # Indeterminate state
@@ -386,6 +556,14 @@ class DICOM2MHAStepManager(StepManager):
         
         return created, total, pct
     
+    def is_complete(self, created: int, total: int) -> bool:
+        """Complete when all CTs are done (structures optional; VALKIM has none)."""
+        ct_expected = self._read_expected_ct_count()
+        if ct_expected is None or ct_expected <= 0:
+            return False
+        ct_created = len(list(self.train_dir.glob("CT_*.mha"))) if self.train_dir and self.train_dir.exists() else 0
+        return ct_created >= ct_expected
+    
     def format_status(self, created: int, total: int) -> str:
         if total == -1:
             return "Converting DICOM → MHA... (scanning)"
@@ -408,60 +586,88 @@ class DICOM2MHAStepManager(StepManager):
             return None
 
 
-class DownsampleStepManager(StepManager):
-    """Monitors downsampling (no viewer change - lingers on CT)."""
-    
+class DownsampleStepManager(WorkerBackedStepManager):
+    """Downsample via DownsampleWorker."""
+
+    _step_key = "DOWNSAMPLE"
+    _status_when_done_text = "Downsample complete."
+
     progress_detail = pyqtSignal(int, int)  # created, total
-    
+
+    def _create_worker(self):
+        from .workers import DownsampleWorker
+
+        return DownsampleWorker(self.train_dir, parent=self)
+
     def get_viewer_type(self) -> Optional[str]:
         return None  # Keep previous viewer
     
-    def get_poll_interval_ms(self) -> int:
-        return 1000
-    
-    def _start_worker(self):
-        """Start the Python DOWNSAMPLE worker."""
-        if not self.train_dir: return
-        self.worker = DownsampleWorker(self.train_dir)
-        # self.worker.start() -> removed, base class handles it
-
     def calculate_progress(self) -> tuple[int, int, int]:
         if not self.train_dir or not self.train_dir.exists():
             return 0, 0, 0
         
-        # Expected: all CT_*.mha + Lungs_*.mha
-        expected_inputs = (len(list(self.train_dir.glob("CT_*.mha"))) +
-                          len(list(self.train_dir.glob("Lungs_*.mha"))))
+        ct_count = len(list(self.train_dir.glob("CT_*.mha")))
+        sub_ct_count = len(list(self.train_dir.glob("sub_CT_*.mha")))
         
-        # Created: sub_CT_*.mha + sub_Lungs_*.mha
-        created_outputs = (len(list(self.train_dir.glob("sub_CT_*.mha"))) +
-                          len(list(self.train_dir.glob("sub_Lungs_*.mha"))))
+        self.progress_detail.emit(sub_ct_count, ct_count)
         
-        # Emit detail
-        self.progress_detail.emit(created_outputs, expected_inputs)
+        pct = int(min(100, (sub_ct_count / ct_count * 100))) if ct_count > 0 else 0
         
-        pct = int(min(100, (created_outputs / expected_inputs * 100))) if expected_inputs > 0 else 0
-        
-        return created_outputs, expected_inputs, pct
+        return sub_ct_count, ct_count, pct
+    
+    def is_complete(self, created: int, total: int) -> bool:
+        """Complete when all CTs downsampled (VALKIM has no Lungs, so sub_CT >= CT is sufficient)."""
+        if total <= 0:
+            return False
+        if not self.train_dir or not self.train_dir.exists():
+            return False
+        ct_count = len(list(self.train_dir.glob("CT_*.mha")))
+        sub_ct_count = len(list(self.train_dir.glob("sub_CT_*.mha")))
+        return sub_ct_count >= ct_count and ct_count > 0
     
     def format_status(self, created: int, total: int) -> str:
         return "Downsampling volumes..."
 
 
-class DRRStepManager(StepManager):
-    """Monitors DRR generation with per-CT progress."""
-    
-    # We detect this dynamically now
+class DRRStepManager(WorkerBackedStepManager):
+    """DRR generation via DrrWorker; poll reflects projection files on disk."""
+
+    _step_key = "DRR"
+    _status_when_done_text = "DRR generation complete."
+
     _proj_cache: Optional[int] = None
-    
+
+    progress_detail = pyqtSignal(str)  # Detailed status like "CT_01/10 • 120/720"
+
+    def __init__(
+        self,
+        geom_path: Path | str | None = None,
+        drr_opts: dict | None = None,
+        parent=None,
+    ):
+        super().__init__(parent)
+        self._geom_path = geom_path
+        self._drr_opts = dict(drr_opts or {})
+
+    def _default_geom_path(self) -> Path:
+        return Path(__file__).resolve().parents[1] / "modules" / "drr_generation" / "RTKGeometry_360.xml"
+
+    def _create_worker(self):
+        from .workers import DrrWorker
+
+        gp = self._geom_path
+        if not gp:
+            gp = self._default_geom_path()
+        return DrrWorker(
+            self.train_dir, Path(gp), drr_opts=self._drr_opts, parent=self
+        )
+
     @property
     def projections_per_ct(self) -> int:
         if DRRStepManager._proj_cache is None:
             DRRStepManager._proj_cache = get_projections_per_ct()
         return DRRStepManager._proj_cache
 
-    progress_detail = pyqtSignal(str)  # Detailed status like "CT_01/10 • 120/720"
-    
     def get_viewer_type(self) -> Optional[str]:
         return 'drr'
     
@@ -515,16 +721,16 @@ class DRRStepManager(StepManager):
         return "Generating DRRs..."
     
     def _group_by_ct(self) -> dict:
-        """Group HNC/BIN files by CT number."""
+        """Group DRR projection files by CT number (tif during generation, bin after compress)."""
         import re
         groups = {}
         
-        # Support both .hnc (generation) and .bin (post-compression)
-        patterns = ["*_Proj_*.hnc", "*_Proj_*.bin"]
+        # Support .tif/.tiff (Python DRR output), .hnc (MATLAB), .bin (post-compress)
+        patterns = ["*_Proj_*.tif", "*_Proj_*.tiff", "*_Proj_*.png", "*_Proj_*.hnc", "*_Proj_*.bin"]
         
         for pattern in patterns:
             for file in self.train_dir.glob(pattern):
-                match = re.search(r"(\d+)_Proj_(\d+)\.(hnc|bin)", file.name)
+                match = re.search(r"(\d+)_Proj_(\d+)\.(tif|tiff|png|hnc|bin)", file.name, re.IGNORECASE)
                 if match:
                     ct_num = int(match.group(1))
                     if ct_num not in groups:
@@ -534,23 +740,25 @@ class DRRStepManager(StepManager):
         return groups
     
     def _get_ct_count(self) -> int:
-        """Get CT count from downsampled volumes."""
-        return len(list(self.train_dir.glob("sub_CT_*.mha")))
+        """Match generate.py: full-res CTs first, else downsampled."""
+        n = len(list(self.train_dir.glob("CT_*.mha")))
+        if n == 0:
+            n = len(list(self.train_dir.glob("sub_CT_*.mha")))
+        return n
 
 
-class CompressStepManager(StepManager):
-    """Monitors DRR compression."""
-    
+class CompressStepManager(WorkerBackedStepManager):
+    """DRR compression via CompressWorker."""
+
+    _step_key = "COMPRESS"
+    _status_when_done_text = "DRR compression complete."
+
     progress_detail = pyqtSignal(int, int)  # created, total
-    
-    def get_poll_interval_ms(self) -> int:
-        return 1000
-    
-    def _start_worker(self):
-        """Start the Python COMPRESS worker."""
-        if not self.train_dir: return
-        self.worker = CompressWorker(self.train_dir)
-        # self.worker.start() -> removed, base class handles it
+
+    def _create_worker(self):
+        from .workers import CompressWorker
+
+        return CompressWorker(self.train_dir, parent=self)
 
     @property
     def projections_per_ct(self) -> int:
@@ -563,8 +771,8 @@ class CompressStepManager(StepManager):
         if not self.train_dir or not self.train_dir.exists():
             return 0, 0, 0
         
-        # Total projections equals total CTs * dynamic count
-        total_cts = len(list(self.train_dir.glob("sub_CT_*.mha")))
+        n_ct = len(list(self.train_dir.glob("CT_*.mha")))
+        total_cts = n_ct if n_ct > 0 else len(list(self.train_dir.glob("sub_CT_*.mha")))
         ppc = self.projections_per_ct
         expected = total_cts * ppc if total_cts > 0 else ppc * 10 
         
@@ -577,14 +785,22 @@ class CompressStepManager(StepManager):
         pct = int(min(100, (created / expected * 100))) if expected > 0 else 0
         
         return created, expected, pct
-
-    def format_status(self, created: int, total: int) -> str:
-        return f"Compressing DRRs... ({created}/{total})"
-
-
-class DVF2DStepManager(StepManager):
-    """Monitors 2D DVF generation."""
     
+    def format_status(self, created: int, total: int) -> str:
+        return "Compressing DRRs..."
+
+
+class DVF2DStepManager(WorkerBackedStepManager):
+    """2D DVF placeholder worker (instant complete until external tool is wired)."""
+
+    _step_key = "DVF2D"
+    _status_when_done_text = "2D DVF step finished."
+
+    def _create_worker(self):
+        from .workers import Dvf2DWorker
+
+        return Dvf2DWorker(self.train_dir, parent=self)
+
     def get_viewer_type(self) -> Optional[str]:
         return None  # Keep DRR viewer
     
@@ -595,9 +811,17 @@ class DVF2DStepManager(StepManager):
         # Look for *2DDVF* files
         created = len(list(self.train_dir.glob("*2DDVF*")))
         
-        # Expected is proportional to BIN/HNC projections
-        projs = (len(list(self.train_dir.glob("*_Proj_*.bin"))) + 
-                 len(list(self.train_dir.glob("*_Proj_*.hnc"))))
+        # Expected: projection count from any pipeline stage (PNG/TIF before compress, bin/hnc after)
+        projs = sum(
+            len(list(self.train_dir.glob(p)))
+            for p in (
+                "*_Proj_*.png",
+                "*_Proj_*.tif",
+                "*_Proj_*.tiff",
+                "*_Proj_*.hnc",
+                "*_Proj_*.bin",
+            )
+        )
         
         if projs > 0 and created > 0:
             pct = min(100, int((created / projs) * 100))
@@ -606,30 +830,22 @@ class DVF2DStepManager(StepManager):
         
         return created, projs, pct
     
-    def _start_worker(self):
-        """Start the Python DRR worker."""
-        if not self.train_dir: return
-        self.worker = DrrWorker(self.train_dir)
-        # self.worker.start() -> removed, base class handles it
-
     def format_status(self, created: int, total: int) -> str:
         return f"Generating 2D DVFs..."
-    
-    def is_complete(self, created: int, total: int) -> bool:
-        # Complete when files exist and haven't changed for several polls
-        return created > 0 and self._completion_checks >= 5
 
 
-class DVF3DLowStepManager(StepManager):
-    """Monitors 3D DVF (downsampled) generation."""
-    
+class DVF3DLowStepManager(WorkerBackedStepManager):
+    """3D DVF (downsampled) via Dvf3DWorker."""
+
+    _step_key = "DVF3D_LOW"
+    _status_when_done_text = "3D DVF (downsampled) complete."
+
     progress_detail = pyqtSignal(int, int)  # created, total
 
-    def _start_worker(self):
-        """Start the Python 3D DVF (low-res) worker."""
-        if not self.train_dir: return
-        self.worker = DvfWorker(self.train_dir, do_low=True, do_full=False)
-        # self.worker.start() -> removed, base class handles it
+    def _create_worker(self):
+        from .workers import Dvf3DWorker
+
+        return Dvf3DWorker(self.train_dir, low_res=True, parent=self)
 
     def get_viewer_type(self) -> Optional[str]:
         return 'dvf'
@@ -638,36 +854,40 @@ class DVF3DLowStepManager(StepManager):
         if not self.train_dir or not self.train_dir.exists():
             return 0, 0, 0
 
-        # Total is the number of downsampled CTs (10) + Lungs (2)
-        total_cts = len(list(self.train_dir.glob("sub_CT_*.mha")))
-        total_lungs = len(list(self.train_dir.glob("sub_Lungs_*.mha")))
-        total = total_cts + total_lungs
-        if total == 0:
-            total = 12 # Default guess if inputs aren't visible yet
+        # Expected: sub_CT count minus 1 (fixed = CT_06, moving = all others)
+        sub_cts = list(self.train_dir.glob("sub_CT_*.mha"))
+        total = max(0, len(sub_cts) - 1)  # exclude fixed phase 06
+        if total == 0 and sub_cts:
+            total = len(sub_cts) - 1
 
-        # Created files are all DVFs *excluding* full-res
-        all_dvf = set(self.train_dir.glob("DVF_*.mha"))
-        full_dvf = set(self.train_dir.glob("DVF_full_*.mha"))
-        created = len(all_dvf - full_dvf)
+        # Worker outputs DVF_sub_01.mha, DVF_sub_02.mha, ... (skips 06)
+        created = len(list(self.train_dir.glob("DVF_sub_*.mha")))
         
         self.progress_detail.emit(created, total)
         
         pct = int(min(100, (created / total * 100))) if total > 0 else 0
         return created, total, pct
+
+    def is_complete(self, created: int, total: int) -> bool:
+        if total <= 0:
+            return False
+        return created >= total
 
     def format_status(self, created: int, total: int) -> str:
         return "Generating 3D DVFs (downsampled)..."
 
-class DVF3DFullStepManager(StepManager):
-    """Monitors 3D DVF (full-res) generation."""
-    
+class DVF3DFullStepManager(WorkerBackedStepManager):
+    """3D DVF (full-res) via Dvf3DWorker."""
+
+    _step_key = "DVF3D_FULL"
+    _status_when_done_text = "3D DVF (full res) complete."
+
     progress_detail = pyqtSignal(int, int)  # created, total
 
-    def _start_worker(self):
-        """Start the Python 3D DVF (full-res) worker."""
-        if not self.train_dir: return
-        self.worker = DvfWorker(self.train_dir, do_low=False, do_full=True)
-        # self.worker.start() -> removed, base class handles it
+    def _create_worker(self):
+        from .workers import Dvf3DWorker
+
+        return Dvf3DWorker(self.train_dir, low_res=False, parent=self)
 
     def get_viewer_type(self) -> Optional[str]:
         return 'dvf'
@@ -676,42 +896,53 @@ class DVF3DFullStepManager(StepManager):
         if not self.train_dir or not self.train_dir.exists():
             return 0, 0, 0
 
-        # Total is the number of full-res volumes to be processed.
-        total_cts = len(list(self.train_dir.glob("CT_*.mha")))
-        total = total_cts if total_cts > 0 else 10 # Default guess
+        # Expected: CT count minus 1 (fixed = CT_06, moving = all others)
+        cts = list(self.train_dir.glob("CT_*.mha"))
+        total = max(0, len(cts) - 1)
+        if total == 0 and cts:
+            total = len(cts) - 1
 
-        # Created files are *only* the DVF_full_*.mha
-        created = len(list(self.train_dir.glob("DVF_full_*.mha")))
+        # Worker outputs DVF_01.mha, DVF_02.mha, ... (skips 06) - exclude DVF_sub_*
+        all_full = [f for f in self.train_dir.glob("DVF_*.mha") if "sub_" not in f.name]
+        created = len(all_full)
         
         self.progress_detail.emit(created, total)
         
         pct = int(min(100, (created / total * 100))) if total > 0 else 0
         return created, total, pct
+
+    def is_complete(self, created: int, total: int) -> bool:
+        if total <= 0:
+            return False
+        return created >= total
 
     def format_status(self, created: int, total: int) -> str:
         return "Generating 3D DVFs (full res)..."
 
 
-class KVPreprocessStepManager(StepManager):
-    """Monitors test data copy and kV preprocessing."""
-    
-    progress_detail = pyqtSignal(int, int) # copied/processed, total_fractions
-    
+class KVPreprocessStepManager(WorkerBackedStepManager):
+    """kV test copy + process via KvPreprocessWorker."""
+
+    _step_key = "KV_PREPROCESS"
+    _status_when_done_text = "kV preprocessing complete."
+
+    progress_detail = pyqtSignal(int, int)  # copied/processed, total_fractions
+
     def __init__(self, rt_ct_pres_list: list, base_dir: str, parent=None):
         super().__init__(parent)
         self.rt_ct_pres_list = rt_ct_pres_list
         self.base_dir = base_dir
         self.total_fractions = 0
-    
-    def _start_worker(self):
-        """Start the Python KV PREPROCESS worker."""
-        if not self.train_dir: return
-        self.worker = KvPreprocessWorker()
-        self.worker.start()
+
+    def _create_worker(self):
+        from .workers import KvPreprocessWorker
+
+        pr = self.train_dir.parent if self.train_dir else Path()
+        return KvPreprocessWorker(self.rt_ct_pres_list, self.base_dir, pr, parent=self)
 
     def get_viewer_type(self) -> Optional[str]:
         return "preparing"
-        
+
     def start(self, train_dir: Path):
         self.total_fractions = self._find_total_fractions()
         super().start(train_dir)

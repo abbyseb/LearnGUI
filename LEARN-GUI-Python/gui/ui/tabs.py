@@ -26,6 +26,7 @@ from pathlib import Path
 class Tab2D(QWidget):
     from PyQt6.QtCore import pyqtSignal
     run_pipeline_requested = pyqtSignal()
+    continue_run_requested = pyqtSignal()
     rerun_step_requested = pyqtSignal(str)
     cancel_requested = pyqtSignal()
     rerun_refresh_requested = pyqtSignal()
@@ -90,7 +91,7 @@ class Tab2D(QWidget):
         pathway_label.setStyleSheet("color: #666; margin-top: 4px;")
         sv.addWidget(pathway_label)
 
-        # 2D processing steps
+        # 2D processing steps (DRR + Compress checked by default for full pipeline)
         processing_2d_steps = [
             ("4. Generate DRRs", "Prerequisite: Downsample volumes"),
             ("5. Compress DRRs", "Prerequisite: Generate DRRs"),
@@ -102,7 +103,8 @@ class Tab2D(QWidget):
             row.setSpacing(8)
             
             chk = QCheckBox()
-            chk.setChecked(False) # EDIT: Was True
+            # Steps 4 & 5 (DRR, Compress) checked by default; 6 (2D DVF) optional
+            chk.setChecked(i < 5)
             chk.setToolTip(tooltip)
             chk.stateChanged.connect(lambda state, idx=i: self._on_step_toggled(idx, state))
             self.step_checkboxes.append(chk)
@@ -122,7 +124,7 @@ class Tab2D(QWidget):
         pathway_3d_label.setStyleSheet("color: #666; margin-top: 4px;")
         sv.addWidget(pathway_3d_label)
 
-        # 3D processing steps
+        # 3D processing steps (only downsampled 3D DVF checked by default)
         processing_3d_steps = [
             ("7. 3D DVFs (Downsampled)", "Prerequisite: Downsample volumes"),
             ("8. 3D DVFs (Full Resolution)", "Prerequisite: DICOM → MHA"), # MODIFIED Tooltip
@@ -134,7 +136,8 @@ class Tab2D(QWidget):
             row.setSpacing(8)
             
             chk = QCheckBox()
-            chk.setChecked(False) # EDIT: Was True
+            # Step 7 (downsampled 3D DVF) checked by default; 8 (full res) and 9 (kV) optional
+            chk.setChecked(i < 7)
             chk.setToolTip(tooltip)
             chk.stateChanged.connect(lambda state, idx=i: self._on_step_toggled(idx, state))
             self.step_checkboxes.append(chk)
@@ -162,6 +165,13 @@ class Tab2D(QWidget):
         self.btn_run_pipeline = QPushButton("Run Pipeline")
         self.btn_run_pipeline.setMinimumWidth(120)
         run_row.addWidget(self.btn_run_pipeline)
+
+        self.btn_continue_run = QPushButton("Continue run…")
+        self.btn_continue_run.setToolTip(
+            "Choose run workspace + optional custom log; creates Patient…/train if needed; "
+            "skips steps that already have outputs (manifest or patient selection for prescriptions)."
+        )
+        run_row.addWidget(self.btn_continue_run)
         
         # Session info label
         self.lbl_session_info = QLabel("")
@@ -299,6 +309,7 @@ class Tab2D(QWidget):
         # ====================================================================
         
         self.btn_run_pipeline.clicked.connect(self.run_pipeline_requested.emit)
+        self.btn_continue_run.clicked.connect(self.continue_run_requested.emit)
         self.btn_rerun_step.clicked.connect(
             lambda: self.rerun_step_requested.emit(self.rerun_step_token())
         )
@@ -419,7 +430,10 @@ class Tab2D(QWidget):
         window = self.window()
         try:
             if hasattr(window, 'controller'):
-                log_path = window.controller.run_log_path
+                ctl = window.controller
+                if hasattr(ctl, "audit") and hasattr(ctl.audit, "flush_log_file"):
+                    ctl.audit.flush_log_file()
+                log_path = ctl.run_log_path
                 if log_path and Path(log_path).exists():
                     QDesktopServices.openUrl(QUrl.fromLocalFile(str(log_path)))
                 else:
@@ -647,10 +661,15 @@ class Tab2D(QWidget):
         }
         return lut.get(text, "COPY")
 
+    def get_drr_generation_options(self) -> dict:
+        """Settings from DRR tab → passed to generate_drrs on the next DRR pipeline step."""
+        return self.drr_viewer.info_panel.get_drr_generation_options()
+
     def set_busy(self, running: bool):
         """Update UI during pipeline execution."""
         running = bool(running)
         self.btn_run_pipeline.setEnabled(not running)
+        self.btn_continue_run.setEnabled(not running)
         
         # Rerun only disabled if actually running (not if session inactive)
         if running:

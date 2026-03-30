@@ -167,8 +167,12 @@ STEP_OUTPUT_PATTERNS = {
     "DRR": {
         "outputs": [
             "*_Proj_*.hnc",
+            "*_Proj_*.png",
+            "*_Proj_*.tif",
+            "*_Proj_*.tiff",
+            "*_Proj_*.bin",
         ],
-        "description": "DRR projection images (HNC format)",
+        "description": "DRR projection images",
     },
     "COMPRESS": {
         "outputs": [
@@ -458,6 +462,10 @@ def purge_step_outputs_from_train(
         if wr not in dt.parents and wr != dt:
             audit_log.add("Safety check failed - train_dir not in work_root", level="ERROR")
             return 0
+
+        if not dt.is_dir():
+            audit_log.add(f"Skipping purge (train/ not present): {dt}", level="INFO")
+            return 0
         
         step_upper = step.upper()
         output_info = get_step_output_info(step_upper)
@@ -515,6 +523,19 @@ def purge_step_outputs_from_train(
     except Exception as e:
         audit_log.add(f"Error during purge: {e}", level="ERROR")
         return 0
+
+
+def purge_train_outputs_for_steps(
+    train_dir: Path,
+    steps: List[str],
+    work_root: Path,
+    audit_log,
+) -> int:
+    """Purge each step's train/ outputs in order (e.g. from first re-run step through pipeline end)."""
+    total = 0
+    for step in steps:
+        total += purge_step_outputs_from_train(train_dir, step, work_root, audit_log)
+    return total
 
 
 # ============================================================================
