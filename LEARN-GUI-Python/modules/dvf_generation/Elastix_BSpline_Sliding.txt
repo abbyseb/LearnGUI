@@ -1,0 +1,39 @@
+// Input images
+(FixedInternalImagePixelType "float")
+(MovingInternalImagePixelType "float")
+
+(UseDirectionCosines "true")
+
+(Registration "MultiResolutionRegistration")
+(Interpolator "BSplineInterpolator")
+(ResampleInterpolator "FinalBSplineInterpolator")
+(Resampler "DefaultResampler")
+
+(FixedImagePyramid "FixedRecursiveImagePyramid")
+(MovingImagePyramid "MovingRecursiveImagePyramid")
+
+(Optimizer "AdaptiveStochasticGradientDescent")
+(Transform "BSplineTransform")
+(Metric "AdvancedMattesMutualInformation")
+
+(FinalGridSpacingInPhysicalUnits 32)
+(HowToCombineTransforms "Compose")
+
+(NumberOfHistogramBins 32)
+(ErodeMask "false")
+
+(NumberOfResolutions 3)
+
+(MaximumNumberOfIterations 16000)
+
+(NumberOfSpatialSamples 2048)
+(NewSamplesEveryIteration "true")
+(ImageSampler "Random")
+
+(BSplineInterpolationOrder 3)
+
+(FinalBSplineInterpolationOrder 3)
+(DefaultPixelValue 0)
+(WriteResultImage "true")
+(ResultImagePixelType "float")
+(ResultImageFormat "mha")
