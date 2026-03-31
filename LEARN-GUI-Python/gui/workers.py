@@ -61,17 +61,18 @@ class CopyWorker(BasePythonWorker):
 
     file_progress = pyqtSignal(int, int)
 
-    def __init__(self, patient_id: str, rt_list: list, src_base: str, dst_base: Path, parent=None):
+    def __init__(self, patient_id: str, rt_list: list, src_base: str, dst_base: Path, dataset_type: str = "clinical", parent=None):
         super().__init__(parent)
         self.patient_id = patient_id
         self.rt_list = rt_list
         self.src_base = Path(src_base)
         self.dst_base = Path(dst_base)
+        self.dataset_type = dataset_type
 
     def run(self):
         try:
             from .run_preparation import build_train_pairs_for_run
-            pairs = build_train_pairs_for_run(self.rt_list, self.dst_base, str(self.src_base))
+            pairs = build_train_pairs_for_run(self.rt_list, self.dst_base, str(self.src_base), dataset_type=self.dataset_type)
             self.log(f"COPY: {len(pairs)} source(s)")
 
             jobs: List[Tuple[Path, Path]] = []
@@ -171,15 +172,15 @@ class CopyWorker(BasePythonWorker):
 
 
 class Dicom2MhaWorker(BasePythonWorker):
-    def __init__(self, train_dir: Path, parent=None):
+    def __init__(self, train_dir: Path, dataset_type: str = "clinical", parent=None):
         super().__init__(parent)
         self.train_dir = Path(train_dir)
+        self.dataset_type = dataset_type
 
     def run(self):
         try:
-            self.log("DICOM2MHA: Starting conversion thread...")
-            self.log(f"DICOM2MHA: Input/output directory: {self.train_dir}")
-            from modules.dicom2mha.convert import convert_dicom_to_mha
+            self.log(f"DICOM2MHA ({self.dataset_type}): Starting conversion...")
+            from modules.dicom2mha.run import run as run_dicom2mha
 
             def on_status(msg: str):
                 self.log(f"DICOM2MHA: {msg}")
@@ -187,8 +188,9 @@ class Dicom2MhaWorker(BasePythonWorker):
             def on_phase_done(done: int, total: int, filename: str):
                 self.log(f"DICOM2MHA: {filename} done ({done}/{total})")
 
-            convert_dicom_to_mha(
+            run_dicom2mha(
                 self.train_dir, self.train_dir,
+                dataset_type=self.dataset_type,
                 on_phase_done=on_phase_done, on_status=on_status
             )
             self.log("DICOM2MHA: Complete")
@@ -198,19 +200,20 @@ class Dicom2MhaWorker(BasePythonWorker):
 
 
 class DownsampleWorker(BasePythonWorker):
-    def __init__(self, train_dir: Path, parent=None):
+    def __init__(self, train_dir: Path, dataset_type: str = "clinical", parent=None):
         super().__init__(parent)
         self.train_dir = Path(train_dir)
+        self.dataset_type = dataset_type
 
     def run(self):
         try:
-            self.log(f"DOWNSAMPLE: Processing {self.train_dir}")
-            from modules.downsampling.downsample import process_directory
+            self.log(f"DOWNSAMPLE ({self.dataset_type}): Processing {self.train_dir}")
+            from modules.downsampling.run import run as run_downsample
 
             def on_volume_done(done: int, total: int, filename: str):
                 self.log(f"DOWNSAMPLE: {filename} done ({done}/{total})")
 
-            process_directory(self.train_dir, on_volume_done=on_volume_done)
+            run_downsample(self.train_dir, dataset_type=self.dataset_type, on_volume_done=on_volume_done)
             self.log("DOWNSAMPLE: Complete")
             self.finished_ok.emit("DOWNSAMPLE")
         except Exception as e:
@@ -223,24 +226,25 @@ class DrrWorker(BasePythonWorker):
         train_dir: Path,
         geom_path: Path,
         drr_opts: dict | None = None,
+        dataset_type: str = "clinical",
         parent=None,
     ):
         super().__init__(parent)
         self.train_dir = Path(train_dir)
         self.geom_path = Path(geom_path)
         self.drr_opts = dict(drr_opts or {})
+        self.dataset_type = dataset_type
 
     def run(self):
         try:
             import re
-
-            from modules.drr_generation.generate import generate_drrs
+            from modules.drr_generation.run import run as run_drr
 
             geom = str(self.geom_path)
             opts = dict(self.drr_opts)
             opts["geometry_path"] = self.geom_path
             self.log(
-                f"DRR: forward_project pipeline → {self.train_dir} (geometry: {geom})"
+                f"DRR ({self.dataset_type}): forward_project pipeline → {self.train_dir} (geometry: {geom})"
             )
 
             mhas = sorted(self.train_dir.glob("CT_*.mha"))
@@ -257,11 +261,12 @@ class DrrWorker(BasePythonWorker):
                 m = re.search(r"(\d+)", mha.stem)
                 ct_num = int(m.group(1)) if m else i
                 self.log(f"DRR: ({i}/{n}) {mha.name}")
-                ok, err = generate_drrs(
+                ok, err = run_drr(
                     str(mha),
                     str(self.train_dir),
                     geometry_file=geom,
                     ct_num=ct_num,
+                    dataset_type=self.dataset_type,
                     **opts,
                 )
                 if not ok:
@@ -277,19 +282,20 @@ class DrrWorker(BasePythonWorker):
 
 
 class CompressWorker(BasePythonWorker):
-    def __init__(self, train_dir: Path, parent=None):
+    def __init__(self, train_dir: Path, dataset_type: str = "clinical", parent=None):
         super().__init__(parent)
         self.train_dir = Path(train_dir)
+        self.dataset_type = dataset_type
 
     def run(self):
         try:
-            self.log("COMPRESS: Converting projections to binary")
-            from modules.drr_compression.compress import process_directory
+            self.log(f"COMPRESS ({self.dataset_type}): Converting projections to binary")
+            from modules.drr_compression.run import run as run_compress
 
             def on_batch_done(done: int, total: int):
                 self.log(f"COMPRESS: {done}/{total} projections")
 
-            process_directory(self.train_dir, on_batch_done=on_batch_done)
+            run_compress(self.train_dir, dataset_type=self.dataset_type, on_batch_done=on_batch_done)
             self.log("COMPRESS: Complete")
             self.finished_ok.emit("COMPRESS")
         except Exception as e:
@@ -308,17 +314,18 @@ class Dvf2DWorker(BasePythonWorker):
 
 
 class Dvf3DWorker(BasePythonWorker):
-    def __init__(self, train_dir: Path, low_res: bool, parent=None):
+    def __init__(self, train_dir: Path, low_res: bool, dataset_type: str = "clinical", parent=None):
         super().__init__(parent)
         self.train_dir = Path(train_dir)
         self.low_res = low_res
+        self.dataset_type = dataset_type
 
     def run(self):
         try:
             mode = "downsampled" if self.low_res else "full-res"
             step_id = "DVF3D_LOW" if self.low_res else "DVF3D_FULL"
-            self.log(f"DVF3D ({mode}): Starting from {self.train_dir}")
-            from modules.dvf_generation.generate import generate_dvf
+            self.log(f"DVF3D ({self.dataset_type}, {mode}): Starting from {self.train_dir}")
+            from modules.dvf_generation.run import run as run_dvf
             mod_path = Path(__file__).resolve().parent.parent / "modules" / "dvf_generation"
             param_file = mod_path / "Elastix_BSpline_Sliding.txt"
             fixed = self.train_dir / "sub_CT_06.mha" if self.low_res else self.train_dir / "CT_06.mha"
@@ -341,7 +348,7 @@ class Dvf3DWorker(BasePythonWorker):
                 out = self.train_dir / f"{prefix}{num}.mha"
                 if m.exists():
                     self.log(f"DVF3D: Registering {m.name} -> fixed (CT_06)")
-                    generate_dvf(fixed, m, param_file, out)
+                    run_dvf(fixed, m, param_file, out, dataset_type=self.dataset_type)
                     done += 1
             self.log(f"DVF3D ({mode}): Complete ({done} DVFs)")
             self.finished_ok.emit(step_id)
@@ -350,27 +357,17 @@ class Dvf3DWorker(BasePythonWorker):
 
 
 class KvPreprocessWorker(BasePythonWorker):
-    def __init__(self, rt_list: list, base_dir: str, patient_root: Path, parent=None):
+    def __init__(self, rt_list: list, base_dir: str, patient_root: Path, dataset_type: str = "clinical", parent=None):
         super().__init__(parent)
         self.rt_list = rt_list
         self.base_dir = base_dir
         self.patient_root = Path(patient_root)
+        self.dataset_type = dataset_type
 
-    def run(self):
         try:
-            from modules.kv_preprocess.process import copy_test_data, process_kv_images
-            if self.rt_list:
-                copy_test_data(self.rt_list[0], self.base_dir, self.patient_root)
-            test_dir = self.patient_root / "test"
-            if test_dir.exists():
-                process_kv_images(test_dir)
-            # Copy source.mha (exhale reference)
-            train = self.patient_root / "train"
-            if not train.exists():
-                train = self.patient_root / "train"
-            ct06 = train / "CT_06.mha" if train.exists() else None
-            if ct06 and ct06.exists():
-                shutil.copy2(ct06, train / "source.mha")
+            from modules.kv_preprocess.run import run as run_kv
+            self.log(f"KV_PREPROCESS ({self.dataset_type}): Starting...")
+            run_kv(self.rt_list, self.base_dir, self.patient_root, dataset_type=self.dataset_type)
             self.finished_ok.emit("KV_PREPROCESS")
         except Exception as e:
             self.failed.emit(str(e))
@@ -384,18 +381,20 @@ class PythonPipelineJob(QThread):
     step_complete = pyqtSignal(str)
 
     def __init__(self, rt_list: list, work_root: Path, train_dir: Path,
-                 skip_copy: bool, skip_dicom2mha: bool, skip_downsample: bool,
-                 skip_drr: bool, skip_compress: bool,
-                 include_2d_dvf: bool, do_3d_low: bool, do_3d_full: bool,
-                 skip_kv_preprocess: bool, base_dir: str, patient_id: str,
-                 drr_generation_options: dict | None = None,
-                 parent=None):
+                  skip_copy: bool, skip_dicom2mha: bool, skip_downsample: bool,
+                  skip_drr: bool, skip_compress: bool, include_2d_dvf: bool,
+                  do_3d_low: bool, do_3d_full: bool,
+                  skip_kv_preprocess: bool, base_dir: str, patient_id: str,
+                  drr_generation_options: dict | None = None,
+                  dataset_type: str = "clinical",
+                  parent=None):
         super().__init__(parent)
         self.rt_list = rt_list
         self.work_root = Path(work_root)
         self.train_dir = Path(train_dir)
         self.base_dir = base_dir
         self.patient_id = patient_id
+        self.dataset_type = dataset_type
         self.skip_copy = skip_copy
         self.skip_dicom2mha = skip_dicom2mha
         self.skip_downsample = skip_downsample
@@ -468,7 +467,7 @@ class PythonPipelineJob(QThread):
         from .run_preparation import build_train_pairs_for_run
         # train_dir is …/<Patient>/train → run folder is two levels up
         run_folder = self.train_dir.parent.parent
-        pairs = build_train_pairs_for_run(self.rt_list, run_folder, self.base_dir)
+        pairs = build_train_pairs_for_run(self.rt_list, run_folder, self.base_dir, dataset_type=self.dataset_type)
         self._log(f"COPY: {len(pairs)} source(s)")
         jobs: List[Tuple[Path, Path]] = []
         for src, dst in pairs:
@@ -574,30 +573,30 @@ class PythonPipelineJob(QThread):
         self._log(f"COPY complete: {total} files")
 
     def _run_dicom2mha(self):
-        self._log("DICOM2MHA: Starting conversion...")
-        self._log(f"DICOM2MHA: Input/output directory: {self.train_dir}")
-        from modules.dicom2mha.convert import convert_dicom_to_mha
-        convert_dicom_to_mha(
+        self._log(f"DICOM2MHA ({self.dataset_type}): Starting conversion...")
+        from modules.dicom2mha.run import run as run_dicom2mha
+        run_dicom2mha(
             self.train_dir, self.train_dir,
+            dataset_type=self.dataset_type,
             on_phase_done=lambda done, total, fn: self._log(f"DICOM2MHA: {fn} done ({done}/{total})"),
             on_status=lambda msg: self._log(f"DICOM2MHA: {msg}"),
         )
         self._log("DICOM2MHA: Complete")
 
     def _run_downsample(self):
-        self._log(f"DOWNSAMPLE: Processing {self.train_dir}")
-        from modules.downsampling.downsample import process_directory
-        process_directory(
+        self._log(f"DOWNSAMPLE ({self.dataset_type}): Processing {self.train_dir}")
+        from modules.downsampling.run import run as run_downsample
+        run_downsample(
             self.train_dir,
+            dataset_type=self.dataset_type,
             on_volume_done=lambda done, total, fn: self._log(f"DOWNSAMPLE: {fn} done ({done}/{total})"),
         )
         self._log("DOWNSAMPLE: Complete")
 
     def _run_drr(self, geom_path: Path):
         import re
-
-        self._log(f"DRR: forward_project pipeline → {self.train_dir}")
-        from modules.drr_generation.generate import generate_drrs
+        self._log(f"DRR ({self.dataset_type}): forward_project pipeline → {self.train_dir}")
+        from modules.drr_generation.run import run as run_drr
 
         opts = dict(self.drr_generation_options)
         opts["geometry_path"] = geom_path
@@ -625,11 +624,12 @@ class PythonPipelineJob(QThread):
             m = re.search(r"(\d+)", mha.stem)
             ct_num = int(m.group(1)) if m else i
             self._log(f"DRR: ({i}/{n}) {mha.name}")
-            ok, err = generate_drrs(
+            ok, err = run_drr(
                 str(mha),
                 str(self.train_dir),
                 geometry_file=str(geom_path),
                 ct_num=ct_num,
+                dataset_type=self.dataset_type,
                 **opts,
             )
             if not ok:
@@ -637,18 +637,19 @@ class PythonPipelineJob(QThread):
         self._log("DRR: Complete")
 
     def _run_compress(self):
-        self._log("COMPRESS: Converting projections to binary")
-        from modules.drr_compression.compress import process_directory
-        process_directory(
+        self._log(f"COMPRESS ({self.dataset_type}): Converting projections to binary")
+        from modules.drr_compression.run import run as run_compress
+        run_compress(
             self.train_dir,
+            dataset_type=self.dataset_type,
             on_batch_done=lambda done, total: self._log(f"COMPRESS: {done}/{total} projections"),
         )
         self._log("COMPRESS: Complete")
 
     def _run_dvf3d(self, low_res: bool):
         mode = "downsampled" if low_res else "full-res"
-        self._log(f"DVF3D ({mode}): Starting from {self.train_dir}")
-        from modules.dvf_generation.generate import generate_dvf
+        self._log(f"DVF3D ({self.dataset_type}, {mode}): Starting from {self.train_dir}")
+        from modules.dvf_generation.run import run as run_dvf
         mod_path = Path(__file__).resolve().parent.parent / "modules" / "dvf_generation"
         param_file = mod_path / "Elastix_BSpline_Sliding.txt"
         fixed = self.train_dir / ("sub_CT_06.mha" if low_res else "CT_06.mha")
@@ -668,20 +669,14 @@ class PythonPipelineJob(QThread):
                 continue
             out = self.train_dir / f"{prefix}{num}.mha"
             self._log(f"DVF3D: Registering {m.name} -> fixed (CT_06)")
-            generate_dvf(fixed, m, param_file, out)
+            run_dvf(fixed, m, param_file, out, dataset_type=self.dataset_type)
             done += 1
         self._log(f"DVF3D ({mode}): Complete ({done} DVFs)")
 
     def _run_kv_preprocess(self):
-        from modules.kv_preprocess.process import copy_test_data, process_kv_images
-        if self.rt_list:
-            copy_test_data(self.rt_list[0], self.base_dir, self.train_dir.parent)
-        test_dir = self.train_dir.parent / "test"
-        if test_dir.exists():
-            process_kv_images(test_dir)
-        ct06 = self.train_dir / "CT_06.mha"
-        if ct06.exists():
-            shutil.copy2(ct06, self.train_dir / "source.mha")
+        from modules.kv_preprocess.run import run as run_kv
+        self._log(f"KV_PREPROCESS ({self.dataset_type}): Starting...")
+        run_kv(self.rt_list, self.base_dir, self.train_dir.parent, dataset_type=self.dataset_type)
         self._log("KV_PREPROCESS: Complete")
 
     def cancel(self):

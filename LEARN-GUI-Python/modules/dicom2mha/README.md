@@ -1,24 +1,27 @@
 # dicom2mha Module
 
-This module handles the conversion of DICOM CT slice series into 3D MetaImage (MHA) volumes, following clinical radiotherapy standards.
+This module handles the conversion of planning CT data from its raw source format (DICOM or MetaImage) into a standardized nomenclature used by the pipeline.
 
-## Files
-- **`convert.py`**: Main entry point for the conversion process. It scans directories for CT DICOM files and orchestrates the conversion using either the gated-phase (VALKIM) or single-series path.
-- **`valkim.py`**: A specialized path for handling gated 4D CT phases. It sorts slices into temporal bins (e.g., 0%, 10%, ... 90%) and assembles them into coherent 3D volumes.
-- **`dicom2iec.py`**: Implements the conversion from DICOM coordinate space to the IEC-style voxel arrays used by the GUI. Handles intensity rescaling (Hounsfield Units) and water attenuation.
-- **`mha_write.py`**: Utility to write uncompressed 32-bit float MetaImage files with specific anatomical headers (RAI orientation, offset, and spacing).
-- **`phase_bin.py`**: Utility to extract the gating phase index (1-10) from DICOM series descriptions (e.g., "Gated 50%" -> Bin 6).
-- **`dicom2iec.py`**: Contains core coordinate transformation logic.
+## Architecture: Dispatch Pattern
+The module follows a **dispatch pattern** to handle different dataset types independently:
+- **`run.py`**: The entry point. It imports the correct implementation based on the `dataset_type` parameter (e.g., `clinical` or `spare`).
+- **`implementations/clinical.py`**: Handles traditional DICOM-to-MHA conversion.
+- **`implementations/spare.py`**: Handles SPARE MetaImage volume renaming and nomenclature normalization.
 
-## Methodology
-The module performs several critical steps to ensure clinical parity:
-1. **LSA Orientation**: DICOM volumes are re-sampled/permuted into **Left-Superior-Anterior (LSA)** orientation. This ensures the Superior-Inferior axis aligns with the treatment machine's rotation axis (Y), as required by RTK.
-2. **HU Rescaling**: Applies `RescaleSlope` and `RescaleIntercept` to map raw pixel values to Hounsfield Units.
-3. **Phase Sorting**: Uses SeriesInstanceUID and Gating percentages to group slices into temporal phases for 4D CT support.
-4. **Water Attenuation**: Optionally scales HU values for specific clinical registration requirements.
+## Dataset Types
 
-## Pipeline Integration
-- **Bigger Picture**: This is the very first step in the "Data Ingest" pipeline. It transforms raw scanner data into standardized volumes used by all subsequent tracking and registration modules.
-- **GUI Connection**: Triggered when the user selects a DICOM directory and clicks "Load Data" or "DICOM 2 MHA". Progress is reported via phase callbacks.
-- **Pre-requisites**: A directory containing valid CT DICOM slices (with `DICM` preamble).
-- **Expected Next Step**: Standard `CT_XX.mha` volumes are created in the patient's `train/` or `test/` directory. The next step is typically **DOWNSAMPLLING** for low-res registration.
+### 1. Clinical (DICOM)
+- **Source**: Nested DICOM folders.
+- **Process**: Uses SimpleITK's `ImageSeriesReader` to group slices into 3D volumes.
+- **Output**: MetaImage (`.mha`) volumes named by series number (e.g., `CT_01.mha`).
+
+### 2. SPARE (MHA/MHD)
+- **Source**: Pre-converted `.mha` volumes.
+- **Process**: Renames volumes to follow the `CT_XX.mha` pattern and generates a `SeriesInfo.txt` for pipeline tracking.
+- **Output**: Standardized `.mha` volumes (e.g., `CT_06.mha` for the fixed reference).
+
+## Usage
+```python
+from modules.dicom2mha.run import run
+run(source_path, target_path, dataset_type="spare")
+```

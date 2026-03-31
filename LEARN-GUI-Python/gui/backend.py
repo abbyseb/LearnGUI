@@ -40,6 +40,18 @@ Path(WORK_ROOT).mkdir(parents=True, exist_ok=True)
 # API Configuration (same as original)
 BASE_API = "http://10.65.67.207:8090"
 
+# Configuration for datasets not managed by the clinical API
+OTHER_DATASETS = {
+    "SPARE": "SPAREChallenge/Evaluation/MonteCarloDatasets/Validation"
+}
+
+def detect_dataset_type(rt_path: str) -> str:
+    """Determine the dataset type (e.g., 'spare', 'clinical') based on the rt_ct_pres path."""
+    rt_path = rt_path.replace("\\", "/")
+    if "SPAREChallenge" in rt_path:
+        return "spare"
+    return "clinical"
+
 def _normalize_patient_id(pid: str) -> str:
     """Convert things like 'VALKIM_1' or 'VALKIM-01' to 'VALKIM_001'."""
     m = re.match(r"^([A-Za-z]+(?:_[A-Za-z]+)?)[-_]?(\d+)$", pid.strip())
@@ -49,7 +61,23 @@ def _normalize_patient_id(pid: str) -> str:
     return f"{prefix}_{int(num):03d}"
 
 def resolve_rt_ct_pres(trial: str, centre: str, selected_patient_ids: list[str]) -> list[str]:
-    """Look up rt_ct_pres for each selected patient via the prescriptions API."""
+    """Look up rt_ct_pres for each selected patient via the prescriptions API or local config."""
+    
+    # Handle "Other Datasets" (Filesystem-based)
+    if trial == "Other Datasets":
+        if centre not in OTHER_DATASETS:
+            return []
+        
+        base_rel = OTHER_DATASETS[centre]
+        out: list[str] = []
+        for pid in selected_patient_ids:
+            # For SPARE, the ID is usually 'P1/MC_V_P1_NS_01'
+            # We ensure it's relative to BASE_DIR
+            path = f"{base_rel}/{pid}"
+            out.append(path.replace("\\", "/"))
+        return out
+
+    # Handle standard Clinical Trials (API-based)
     if requests is None:
         raise RuntimeError("The 'requests' package is required. Run: pip install requests")
 

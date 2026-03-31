@@ -334,7 +334,7 @@ class MainWindow(QMainWindow):
             # 1. Manually load the correct base CT
             # Find the monitor of the *source* panel to get its base CT path
             source_monitor = None
-            if hasattr(self.controller, '_current_viewer_monitor') and self.controller._current_viewer_monitor.viewer == source:
+            if hasattr(self.controller, '_current_viewer_monitor') and self.controller._current_viewer_monitor and self.controller._current_viewer_monitor.viewer == source:
                 source_monitor = self.controller._current_viewer_monitor
 
             if source_monitor and source_monitor._source_mha_path and source_monitor._source_mha_path.exists():

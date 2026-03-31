@@ -223,6 +223,7 @@ class CTQuadPanel(QGroupBox):
         self._sitk_base_img = None
         self._sar_meta = None
         self._sar_reorient_params = None  # Stores perm/flips for overlay processing
+        self._dataset_type = "clinical"
         self._perm_phys_to_log: tuple[int,int,int] | None = None
         self._spacing_SAR: tuple[float,float,float] | None = None
 
@@ -283,9 +284,13 @@ class CTQuadPanel(QGroupBox):
 
     def set_info_dict(self, info: dict):
         source_raw = str(info.get("source", "—"))
-        source_val = source_raw.split(":", 1)[1].strip() if source_raw.startswith("DICOM:") else source_raw
+        # Strip both DICOM: and MHA: prefixes for cleaner display
+        for prefix in ("DICOM:", "MHA:"):
+            if source_raw.startswith(prefix):
+                source_raw = source_raw[len(prefix):].strip()
+                break
         self.set_info(
-            source=source_val,
+            source=source_raw,
             dims=str(info.get("dims", "—")),
             vox=str(info.get("vox", "—")),
             count=str(info.get("count", "—")),
@@ -308,7 +313,7 @@ class CTQuadPanel(QGroupBox):
             lbl.setPixmap(QPixmap())
             lbl.setText("") 
         
-        apply_placeholder_style(self.lbl_ax, "DICOM Preview")
+        apply_placeholder_style(self.lbl_ax, "Volume Preview")
         self.lbl_ax.set_bl_text("Axial")
         self.lbl_co.set_bl_text("Coronal")
         self.lbl_sa.set_bl_text("Sagittal")
@@ -455,7 +460,8 @@ class CTQuadPanel(QGroupBox):
     # =========================
     # MHA volume API (Logic Unchanged, just referencing self.info_panel)
     # =========================
-    def set_mha_volume(self, vol: np.ndarray, spacing: tuple[float,float,float], origin=None, direction=None, sitk_image=None):
+    def set_mha_volume(self, vol: np.ndarray, spacing: tuple[float,float,float], origin=None, direction=None, sitk_image=None, dataset_type="clinical"):
+        self._dataset_type = dataset_type
         self.set_mode("triptych")
 
         try:
@@ -501,6 +507,19 @@ class CTQuadPanel(QGroupBox):
         self._sar_meta = _compute_sar_meta(img)
 
         vol_SAR, spacing_SAR = self._reorient_image_to_SAR_numpy(img)
+        
+        # --- SPARE AXIS SWAP ---
+        if dataset_type == "spare":
+            # Swap Axial (S) and Coronal (A) per user request.
+            # This also naturally rotates the Sagittal (S,A) plane by 90 degrees.
+            vol_SAR = np.transpose(vol_SAR, (1, 0, 2))
+            spacing_SAR = (spacing_SAR[1], spacing_SAR[0], spacing_SAR[2])
+            # Update SAR reorient params so overlays follow
+            p = self._sar_reorient_params
+            p['perm_zyx_to_SAR'] = (p['perm_zyx_to_SAR'][1], p['perm_zyx_to_SAR'][0], p['perm_zyx_to_SAR'][2])
+            p['flips_SAR'] = (p['flips_SAR'][1], p['flips_SAR'][0], p['flips_SAR'][2])
+        # -----------------------
+
         self._spacing_SAR = spacing_SAR
         vol_log, spacing_log = self._build_logical_from_physical(vol_SAR, spacing_SAR)
 
@@ -612,6 +631,10 @@ class CTQuadPanel(QGroupBox):
             perm = (2,1,0); spacing_log = (r_mm, a_mm, s_mm)
         vol_log = np.transpose(vol_SAR, perm)
         return vol_log, spacing_log
+
+    def is_volume_loaded(self) -> bool:
+        """Returns True if a 3D volume is currently loaded and ready for triptych display."""
+        return self._vol_log is not None
 
     # ---------------- UI mechanics ----------------
     def _sync_sliders_from_state(self):
@@ -1288,7 +1311,9 @@ class DVFPanel(CTQuadPanel):
         self.dvf_info = DVFInfoWidget()
         
         # 2. Pass it up to CTQuadPanel so it gets inserted into the layout
-        super().__init__(custom_info_widget=self.dvf_info, *a, **kw)
+        # title is the first positional argument of CTQuadPanel.__init__
+        title = a[0] if len(a) > 0 else "DVF Viewer"
+        super().__init__(title=title, custom_info_widget=self.dvf_info)
 
         # 3. Connect DVF-specific signals from the info widget
         self.dvf_info.dvf_changed.connect(self._on_dvf_phase_changed)
@@ -1325,9 +1350,9 @@ class DVFPanel(CTQuadPanel):
         self._update_dvf_legend()
 
     # ------------- plane swap (rebinding) -------------
-    def set_mha_volume(self, vol, spacing, origin=None, direction=None, sitk_image=None):
+    def set_mha_volume(self, vol, spacing, origin=None, direction=None, sitk_image=None, dataset_type="clinical"):
         # Call parent to set up base logical state and reset indices
-        super().set_mha_volume(vol, spacing, origin, direction, sitk_image=sitk_image)
+        super().set_mha_volume(vol, spacing, origin, direction, sitk_image=sitk_image, dataset_type=dataset_type)
         
         # Cache the "original" logical state from the parent
         self._vol_log0 = getattr(self, "_vol_log", None)
@@ -1580,6 +1605,9 @@ class DVFPanel(CTQuadPanel):
                                 ov_c = np.transpose(vol_SAR_c, self._perm_phys_to_log)
                         layers.append(ov_c.astype(np.float32))
                     if len(layers) == 3:
+                        if self._dataset_type == "spare":
+                            # Swap dz and dy components because axes S and A were swapped spatially
+                            layers[0], layers[1] = layers[1], layers[0]
                         self._dvf_vec_log0 = np.stack(layers, axis=-1)
                 except Exception:
                     self._dvf_vec_log0 = None

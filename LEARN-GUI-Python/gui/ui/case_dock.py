@@ -11,7 +11,7 @@ from PyQt6.QtWidgets import (
 
 from ..audit import AuditLog
 from ..run_preparation import centre_from_rt  # Use authoritative version
-from ..backend import BASE_API, BASE_DIR, set_data_root
+from ..backend import BASE_API, BASE_DIR, set_data_root, OTHER_DATASETS
 
 
 class CaseDock(QDockWidget):
@@ -102,37 +102,41 @@ class CaseDock(QDockWidget):
         self._on_trial_changed(self.cb_trial.currentText())
 
     def _fetch_trials(self) -> List[str]:
+        api_trials: List[str] = []
+
+        # Try /trials endpoint first
         try:
             import requests
             r = requests.get(f"{BASE_API}/trials", timeout=20)
             r.raise_for_status()
             data = r.json()
-            trials = [str(t) for t in data.get("trials", []) if t]
-            trials = sorted(set(trials))
-            if trials:
-                return trials
+            api_trials = sorted(set(str(t) for t in data.get("trials", []) if t))
         except Exception as e:
             self.audit.add(f"INFO: /trials unavailable, falling back: {e}")
 
-        try:
-            import requests
-            r = requests.get(f"{BASE_API}/prescriptions", timeout=30)
-            r.raise_for_status()
-            pres = r.json().get("prescriptions", [])
-            found = set()
-            for p in pres:
-                tr = p.get("trial")
-                if tr:
-                    found.add(str(tr)); continue
-                rt = (p.get("rt_ct_pres") or "").strip("/")
-                if rt:
-                    segs = rt.split("/")
-                    if segs:
-                        found.add(segs[0])
-            return sorted(found)
-        except Exception as e:
-            self.audit.add(f"ERROR: Failed to infer trials from prescriptions: {e}")
-            return []
+        # If that didn't work, try /prescriptions
+        if not api_trials:
+            try:
+                import requests
+                r = requests.get(f"{BASE_API}/prescriptions", timeout=30)
+                r.raise_for_status()
+                pres = r.json().get("prescriptions", [])
+                found = set()
+                for p in pres:
+                    tr = p.get("trial")
+                    if tr:
+                        found.add(str(tr)); continue
+                    rt = (p.get("rt_ct_pres") or "").strip("/")
+                    if rt:
+                        segs = rt.split("/")
+                        if segs:
+                            found.add(segs[0])
+                api_trials = sorted(found)
+            except Exception as e:
+                self.audit.add(f"ERROR: Failed to infer trials from prescriptions: {e}")
+
+        # Always append "Other Datasets" at the end
+        return api_trials + ["Other Datasets"]
 
     def _load_centres_for_trial(self, trial: str) -> List[str]:
         try:
@@ -167,6 +171,18 @@ class CaseDock(QDockWidget):
             return []
 
     def _on_trial_changed(self, trial: str):
+        if trial == "Other Datasets":
+            self._all_patients = []
+            self.cb_centre.blockSignals(True)
+            self.cb_centre.clear()
+            self.cb_centre.addItem("Select Dataset...")
+            for ds in sorted(OTHER_DATASETS.keys()):
+                self.cb_centre.addItem(ds)
+            self.cb_centre.setEnabled(True)
+            self.cb_centre.blockSignals(False)
+            self._apply_filters()
+            return
+
         rows = self._fetch_patients_for_trial(trial)
         self._all_patients = rows
 
@@ -188,14 +204,54 @@ class CaseDock(QDockWidget):
         self._apply_filters()
 
     def _apply_filters(self):
+        trial = self.cb_trial.currentText()
         centre = self.cb_centre.currentText()
         term = self.txt_search.text().strip().lower()
-        rows = self._all_patients
-        if centre and centre != "All centres":
-            rows = [r for r in rows if r.get("centre") == centre]
+
+        if trial == "Other Datasets":
+            if centre == "Select Dataset...":
+                self._all_patients = []
+            elif "SPARE" in centre:
+                self._all_patients = self._fetch_patients_from_filesystem("SPARE")
+            rows = self._all_patients
+        else:
+            rows = self._all_patients
+            if centre and centre != "All centres":
+                rows = [r for r in rows if r.get("centre") == centre]
+
         if term:
             rows = [r for r in rows if term in (r.get("id", "").lower())]
         self._refresh_table(rows)
+
+    def _fetch_patients_from_filesystem(self, category: str) -> List[Dict[str, str]]:
+        if category != "SPARE":
+            return []
+        
+        from pathlib import Path
+        root = Path(BASE_DIR) / OTHER_DATASETS["SPARE"]
+        if not root.exists():
+            self.audit.add(f"ERROR: SPARE root not found at {root}")
+            return []
+        
+        rows = []
+        # Structure is Validation/P1/MC_...
+        # We scan P1, P2...
+        try:
+            for p_folder in sorted(root.glob("P*")):
+                if not p_folder.is_dir():
+                    continue
+                centre = p_folder.name
+                for pat_folder in sorted(p_folder.glob("MC_*")):
+                    if pat_folder.is_dir():
+                        # Patient ID includes the P-folder as part of the unique key for selection
+                        rows.append({
+                            "id": f"{centre}/{pat_folder.name}",
+                            "centre": centre
+                        })
+        except Exception as e:
+            self.audit.add(f"ERROR: Filesystem scan failed: {e}")
+        
+        return rows
 
     def _refresh_table(self, rows: List[Dict[str, str]]):
         self.tbl.setRowCount(len(rows))

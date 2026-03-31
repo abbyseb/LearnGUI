@@ -55,21 +55,27 @@ def patient_id_from_rt(rt: str, trial: str) -> str:
 
 def train_src_from_rt(rt: str, base_dir: str) -> Path:
     """
-    Map rt_ct_pres to MAGIKmodel/FilesForModelling source directory (read-only).
+    Map rt_ct_pres to the source directory (read-only).
+    For clinical trials: maps to MAGIKmodel/FilesForModelling.
+    For SPARE datasets: returns the patient folder directly (no transformation).
     base_dir is PRJ-RPL (e.g. Z:/...): we only read from it.
     """
     parts = [p for p in (rt or "").strip("/").split("/") if p]
-    
+
+    # SPARE datasets: the path IS the patient folder relative to base_dir.
+    # e.g., rt = 'SPAREChallenge/Evaluation/MonteCarloDatasets/Validation/P1/MC_V_P1_LD_01'
+    if "SPAREChallenge" in (rt or ""):
+        return Path(base_dir).joinpath(*parts)
+
     # Check for standalone mode (if rt already points to something inside base_dir)
-    # This happens if rt_list was populated from a local scan
     if parts and parts[0] == "data":
         return Path(base_dir).joinpath(*parts[1:])
 
-    # Standard trial structure mapping
-    # Original: /TRIAL/CENTRE/PlanningFiles/PatientXX -> .../TRIAL/CENTRE/MAGIKmodel/PatientXX/FilesForModelling
+    # Standard clinical trial structure mapping:
+    # /TRIAL/CENTRE/PlanningFiles/PatientXX -> .../TRIAL/CENTRE/MAGIKmodel/PatientXX/FilesForModelling
     if len(parts) >= 3:
         parts[2] = "MAGIKmodel"
-    
+
     parts.append("FilesForModelling")
     return Path(base_dir).joinpath(*parts)
 
@@ -86,19 +92,25 @@ def selection_line(trial: str, centre_label: str, ids: list[str]) -> str:
 # DICOM COUNTING
 # ============================================================================
 
-def count_dicoms_recursive(path: Path) -> int:
-    """Count DICOM files in a source tree (for copy progress)."""
+def count_dicoms_recursive(path: Path, dataset_type: str = "clinical") -> int:
+    """Count source files in a tree (DICOMs for clinical, MHAs for SPARE)."""
     import os
     total = 0
     if not path.exists():
         return 0
+    
+    extensions = {".dcm", ".dicom", ".ima"}
+    if dataset_type == "spare":
+        # SPARE challenge uses MHA files directly as sources
+        extensions.add(".mha")
+
     for root, _, files in os.walk(path):
         for n in files:
             p = Path(root) / n
-            suf = p.suffix.lower()
-            if suf in (".dcm", ".dicom", ".ima"):
+            ext = p.suffix.lower()
+            if ext in extensions:
                 total += 1
-            elif suf == "":
+            elif ext == "":
                 try:
                     with open(p, "rb") as fh:
                         fh.seek(128)
@@ -108,21 +120,26 @@ def count_dicoms_recursive(path: Path) -> int:
                     pass
     return total
 
-
-def snapshot_dicoms(root: Path) -> tuple[int, int, dict[int, int]]:
+def snapshot_dicoms(root: Path, dataset_type: str = "clinical") -> tuple[int, int, dict[int, int]]:
     """
     Fast snapshot: (file_count, total_bytes, multiset_by_size).
     Used for prerequisite checking.
     """
-    cnt, total, sizes = 0, 0, {}
+    cnt = 0
+    total = 0
+    sizes: dict[int, int] = {}
     if not root.exists():
         return 0, 0, {}
     
+    extensions = {".dcm", ".dicom", ".ima"}
+    if dataset_type == "spare":
+        extensions.add(".mha")
+
     for p in root.rglob("*"):
         if not p.is_file():
             continue
         ext = p.suffix.lower()
-        if ext not in {".dcm", ".dicom", ".ima"}:
+        if ext not in extensions:
             continue
         try:
             sz = p.stat().st_size
@@ -289,7 +306,8 @@ def get_downstream_steps(step: str) -> List[str]:
 def check_step_prerequisites_exist(
     train_dir: Path, 
     patient_root: Path,
-    step: str
+    step: str,
+    dataset_type: str = "clinical"
 ) -> Tuple[bool, str]:
     """
     Check if prerequisites exist for a step (in train/ OR intermediates/).
@@ -301,6 +319,7 @@ def check_step_prerequisites_exist(
         train_dir: Path to train/ directory
         patient_root: Path to patient root directory (contains train/ and intermediates/)
         step: Step identifier (e.g., "DICOM2MHA", "DOWNSAMPLE")
+        dataset_type: Type of dataset for DICOM validation
     
     Returns:
         (can_run, description) where description explains what was found or missing
@@ -314,16 +333,17 @@ def check_step_prerequisites_exist(
     if step_upper == "COPY" or step_upper == "KV_PREPROCESS": # MODIFIED
         return True, "Patient selection is the only prerequisite"
     
-    # Special case: DICOM→MHA needs DICOMs
+    # Special case: DICOM→MHA needs DICOMs (or MHA source for SPARE)
     if step_upper == "DICOM2MHA":
-        train_dcm, _, _ = snapshot_dicoms(train_dir)
+        train_dcm, _, _ = snapshot_dicoms(train_dir, dataset_type)
         archive_dcm = 0
         if intermediates_dir.exists():
-            archive_dcm, _, _ = snapshot_dicoms(intermediates_dir)
+            archive_dcm, _, _ = snapshot_dicoms(intermediates_dir, dataset_type)
         
         total = train_dcm + archive_dcm
+        label = "Volume" if dataset_type == "spare" else "DICOM"
         if total == 0:
-            return False, "No DICOM files available (source files deleted or not yet copied)"
+            return False, f"No {label} files available (source files deleted or not yet copied)"
         
         # Success - provide details
         parts = []
@@ -331,7 +351,7 @@ def check_step_prerequisites_exist(
             parts.append(f"{train_dcm} in train/")
         if archive_dcm > 0:
             parts.append(f"{archive_dcm} in intermediates/")
-        return True, f"{total} DICOM files available ({', '.join(parts)})"
+        return True, f"{total} {label} files available ({', '.join(parts)})"
     
     # Other steps: check file patterns
     required = prereq_info["required_patterns"]
@@ -392,10 +412,11 @@ def _pattern_to_friendly_name(pattern: str) -> str:
 # ============================================================================
 
 def validate_rerun_prerequisites(
-    pairs: list[tuple[Path, Path]],
+    train_pairs: list[tuple[Path, Path]],
     patient_root: Path,
     step: str,
-    audit_log
+    audit_log,
+    dataset_type: str = "clinical"
 ) -> Tuple[bool, str]:
     """
     Validate prerequisites exist for rerun (checks train/ OR intermediates/).
@@ -403,10 +424,11 @@ def validate_rerun_prerequisites(
     This is called by controller before purging outputs.
     
     Args:
-        pairs: List of (src, train_dir) tuples (src ignored for rerun)
+        train_pairs: List of (src, train_dir) tuples
         patient_root: Patient root directory (contains train/ and intermediates/)
         step: Step to validate (e.g., "DICOM2MHA", "DOWNSAMPLE")
         audit_log: Audit logger for detailed logging
+        dataset_type: Type of dataset for DICOM validation
     
     Returns:
         (success, error_message) - error_message is empty string on success
@@ -414,12 +436,12 @@ def validate_rerun_prerequisites(
     step_upper = step.upper()
     audit_log.add(f"--- RERUN VALIDATION: {step_upper} ---", level="HEADER")
     
-    for idx, (src, dst_train) in enumerate(pairs):
+    for idx, (src, dst_train) in enumerate(train_pairs):
         patient = patient_root.name
-        audit_log.add(f"Validating patient {idx+1}/{len(pairs)}: {patient}")
+        audit_log.add(f"Validating patient {idx+1}/{len(train_pairs)}: {patient}")
         
         # Check prerequisites (both locations)
-        can_run, details = check_step_prerequisites_exist(dst_train, patient_root, step_upper)
+        can_run, details = check_step_prerequisites_exist(dst_train, patient_root, step_upper, dataset_type)
         
         if not can_run:
             audit_log.add(f"  ✗ {details}", level="VALIDATE")
@@ -542,30 +564,23 @@ def purge_train_outputs_for_steps(
 # TRAIN PAIR BUILDING
 # ============================================================================
 
-def build_train_pairs_for_run(rt_list: List[str], run_folder: Path, base_dir: str) -> list[tuple[Path, Path]]:
+def build_train_pairs_for_run(rt_list: List[str], run_folder: Path, base_dir: str, *, dataset_type: str = "clinical", **kwargs) -> list[tuple[Path, Path]]:
     """
-    Build pairs for a run folder, pointing to the correct MATLAB-created
-    patient subfolder (e.g., .../Run_.../Patient01/train).
+    Build (src, train_dir) pairs for a run folder.
+    For clinical: src = MAGIKmodel/FilesForModelling, patient folder from rt path.
+    For SPARE: src = patient folder directly (contains .mha files), patient folder = last segment of rt path.
     base_dir (PRJ-RPL) is read-only: src_path is read from, train_dir is under work_root.
-
-    Args:
-        rt_list: List of rt_ct_pres paths
-        run_folder: Run folder path (e.g., .../VALKIM_001_Run_20251015_143045)
-        base_dir: Base directory for source data (read-only; never write to it)
-
-    Returns:
-        List of (src_path, train_dir) tuples
     """
     pairs = []
-    # This assumes a single patient per run, which is consistent with the UI flow.
-    # The watchers will monitor the destination path generated here.
     if rt_list:
+        # For SPARE, the patient folder IS the last segment of the path (e.g., MC_V_P1_LD_01)
+        # For clinical, it's extracted from something like .../PatientXX/
         patient_folder = patient_folder_from_rt(rt_list[0])
         train_dir = run_folder / patient_folder / "train"
         for rt in rt_list:
             src = train_src_from_rt(rt, base_dir)
             pairs.append((src, train_dir))
-    
+
     return pairs
 
 

@@ -112,7 +112,7 @@ def read_mha_volume(path: Path) -> tuple[
             last_exception = e
             time.sleep(0.2)
 
-    raise last_exception
+    return None # Return None instead of raising, let caller handle it.
 
 
 # --------- DICOM helpers ---------

@@ -50,6 +50,7 @@ STEP_DISPLAY_NAMES = {
 STEP_UI_INDEX = {step: idx for idx, step in enumerate(STEP_ORDER)}
 
 VIEWER_STEP_MAP = {
+    "COPY": "ct",
     "DICOM2MHA": "ct",
     "DRR": "drr",
     "DVF3D_LOW": "dvf",
@@ -185,16 +186,16 @@ class MainController(QObject):
         self._update_ui_for_step_start(step_name)
         
         # --- FIX: Smart viewer switching for COPY ---
-        if step_name == "COPY":
-            self.log("Activating 'ct' viewer panel for COPY step (no monitor).", level="DEBUG")
-            # Manually switch the UI panel without starting a monitor
+        # For clinical DICOM COPY, we switch the panel manually (CopyStepManager handles preview).
+        # For SPARE COPY, we want a real CTViewerMonitor to poll for .mha files.
+        if step_name == "COPY" and self.dataset_type != "spare":
+            self.log("Activating 'ct' viewer panel for clinical COPY step (no monitor).", level="DEBUG")
             self.win.tab2d.switch_viewer('ct')
-            # Ensure the viewer is cleared to show DICOM preview (single) mode
             self.win.tab2d.ct_quad.clear() 
         else:
             viewer_type = VIEWER_STEP_MAP.get(step_name)
             if viewer_type:
-                # This will start the appropriate monitor (e.g., CTViewerMonitor for DICOM2MHA)
+                # This will start the appropriate monitor (e.g., CTViewerMonitor for DICOM2MHA or SPARE COPY)
                 self._switch_viewer(viewer_type)
         # --- END FIX ---
 
@@ -222,9 +223,11 @@ class MainController(QObject):
                 else:
                     parts.append(f"{files_done} files")
                 if d_expected > 0:
-                    parts.append(f"{d_arrived}/{d_expected} DICOMs")
+                    label = "Volumes" if self.dataset_type == "spare" else "DICOMs"
+                    parts.append(f"{d_arrived}/{d_expected} {label}")
                 else:
-                    parts.append(f"{d_arrived} DICOMs")
+                    label = "Volumes" if self.dataset_type == "spare" else "DICOMs"
+                    parts.append(f"{d_arrived} {label}")
                 self.win.tab2d.bar_info.setText(" · ".join(parts))
             elif self._active_step_name == "COPY" and len(args) == 2:
                 copied, total = args
@@ -370,16 +373,22 @@ class MainController(QObject):
         do_3d_full: bool,
         skip_kv_preprocess: bool,
         copy_extra: dict | None,
+        dataset_type: str = "clinical",
     ) -> List[tuple[str, dict]]:
         q: List[tuple[str, dict]] = []
         if not skip_copy:
             if copy_extra is None:
                 raise ValueError("Internal error: COPY enabled without copy parameters.")
+            # Copy extra already includes patient_id etc. We add dataset_type.
+            copy_extra["dataset_type"] = dataset_type
             q.append(("COPY", copy_extra))
+        
         if not skip_dicom2mha:
-            q.append(("DICOM2MHA", {}))
+            q.append(("DICOM2MHA", {"dataset_type": dataset_type}))
+        
         if not skip_downsample:
-            q.append(("DOWNSAMPLE", {}))
+            q.append(("DOWNSAMPLE", {"dataset_type": dataset_type}))
+        
         if not skip_drr:
             drr_opts = self.win.tab2d.get_drr_generation_options()
             q.append(
@@ -388,21 +397,28 @@ class MainController(QObject):
                     {
                         "geom_path": drr_opts.get("geometry_path"),
                         "drr_opts": drr_opts,
+                        "dataset_type": dataset_type,
                     },
                 )
             )
+        
         if not skip_compress:
-            q.append(("COMPRESS", {}))
+            q.append(("COMPRESS", {"dataset_type": dataset_type}))
+        
         if not skip_2d_dvf:
-            q.append(("DVF2D", {}))
+            q.append(("DVF2D", {"dataset_type": dataset_type}))
+        
         if do_3d_low:
-            q.append(("DVF3D_LOW", {}))
+            q.append(("DVF3D_LOW", {"dataset_type": dataset_type}))
+        
         if do_3d_full:
-            q.append(("DVF3D_FULL", {}))
+            q.append(("DVF3D_FULL", {"dataset_type": dataset_type}))
+        
         if not skip_kv_preprocess:
             q.append(("KV_PREPROCESS", {
                 "rt_ct_pres_list": self._last_rt_list,
                 "base_dir": backend.BASE_DIR,
+                "dataset_type": dataset_type,
             }))
         return q
 
@@ -439,6 +455,7 @@ class MainController(QObject):
                 return
             
             self._last_rt_list = rt_list[:]
+            self.dataset_type = backend.detect_dataset_type(rt_list[0])
             patient_id = patient_id_from_rt(rt_list[0], trial)
             
             self.current_run_folder, self.current_run_log = create_run_structure(self.work_root, patient_id)
@@ -490,9 +507,10 @@ class MainController(QObject):
                 'patient_id': patient_id,
                 'rt_list': rt_list,
                 'src_base': str(backend.BASE_DIR),
-                'dst_base': str(self.current_run_folder)
+                'dst_base': str(self.current_run_folder),
+                'dataset_type': self.dataset_type
             }
-            total_dicoms = sum(count_dicoms_recursive(src) for src, _ in pairs)
+            total_dicoms = sum(count_dicoms_recursive(src, self.dataset_type) for src, _ in pairs)
             copy_extra = {
                 "total_dicoms": total_dicoms,
                 "patient_id": patient_id,
@@ -511,6 +529,7 @@ class MainController(QObject):
                 do_3d_full=do_3d_full,
                 skip_kv_preprocess=skip_kv_preprocess,
                 copy_extra=copy_extra if not skip_copy else None,
+                dataset_type=self.dataset_type
             )
 
             # Start the first step
@@ -784,6 +803,11 @@ class MainController(QObject):
         patient_id = (
             patient_id_from_rt(rt_list[0], trial) if rt_list else extract_patient_id(run_folder.name)
         )
+        if rt_list:
+            self.dataset_type = backend.detect_dataset_type(rt_list[0])
+        else:
+            # Fallback for continue from orphan folder (or we could try to detect from folder name)
+            self.dataset_type = "spare" if "SPARE" in run_folder.name else "clinical"
 
         if rt_list:
             bpairs = build_train_pairs_for_run(rt_list, run_folder, backend.BASE_DIR)
@@ -804,7 +828,7 @@ class MainController(QObject):
         copy_extra = None
         if not skip_copy:
             pairs_for_counting = build_train_pairs_for_run(rt_list, run_folder, backend.BASE_DIR)
-            total_dicoms = sum(count_dicoms_recursive(src) for src, _ in pairs_for_counting)
+            total_dicoms = sum(count_dicoms_recursive(src, self.dataset_type) for src, _ in pairs_for_counting)
             copy_extra = {
                 "total_dicoms": total_dicoms,
                 "patient_id": patient_id,
@@ -832,6 +856,7 @@ class MainController(QObject):
                 do_3d_full=do_3d_full,
                 skip_kv_preprocess=skip_kv_preprocess,
                 copy_extra=copy_extra,
+                dataset_type=self.dataset_type
             )
         except ValueError as e:
             QMessageBox.critical(self.win, "Pipeline", str(e))
@@ -915,7 +940,7 @@ class MainController(QObject):
         self._is_rerun_mode = True
         self._step_queue = [] # Queue will be empty after the first step since it's a single-step rerun
         
-        step_kwargs = {}
+        step_kwargs = {"dataset_type": self.dataset_type}
         if step.upper() == "COPY":
             # CopyWorker needs the same routing as a full run (parallel copy into train/).
             if not self._last_rt_list:
@@ -936,9 +961,9 @@ class MainController(QObject):
                     backend.BASE_DIR,
                 )
                 self.log("Rerun COPY: Counting DICOMs from original source...")
-                total_dicoms = sum(count_dicoms_recursive(src) for src, _ in pairs_for_counting)
+                total_dicoms = sum(count_dicoms_recursive(src, self.dataset_type) for src, _ in pairs_for_counting)
                 step_kwargs["total_dicoms"] = total_dicoms
-                self.log(f"Found {total_dicoms} DICOMs for copy progress.")
+                self.log(f"Found {total_dicoms} items for copy progress.")
 
         elif step.upper() == "KV_PREPROCESS":
             step_kwargs['rt_ct_pres_list'] = self._last_rt_list

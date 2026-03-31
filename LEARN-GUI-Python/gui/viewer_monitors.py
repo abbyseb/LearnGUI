@@ -9,14 +9,14 @@ from typing import Dict, Optional, Set
 from .step_managers import get_projections_per_ct
 import traceback
 import numpy as np
-
-from PyQt6.QtCore import QObject, QTimer, pyqtSignal
+import SimpleITK as sitk
+from PIL import Image
+from PyQt6.QtCore import Qt, QObject, pyqtSignal, QTimer
+from PyQt6.QtGui import QPixmap, QImage
 
 
 def _u8_to_grayscale_pixmap(u8: np.ndarray):
     """Row-major uint8 H×W → QPixmap (same buffer layout as Qt Format_Grayscale8)."""
-    from PyQt6.QtGui import QImage, QPixmap
-
     u8 = np.ascontiguousarray(u8)
     if u8.ndim != 2:
         return None
@@ -51,14 +51,14 @@ class ViewerMonitor(QObject):
     
     files_found = pyqtSignal(list)
     
-    def __init__(self, viewer_widget, parent=None):
+    def __init__(self, viewer_widget, parent=None, **kwargs):
         super().__init__(parent)
         self.viewer = viewer_widget
         self.train_dir: Optional[Path] = None
         self.is_active = False
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._poll)
-        self._last_files = set()
+        self._last_state = {} # path -> size
         
         self.audit = None
         if parent and hasattr(parent, 'audit'):
@@ -71,7 +71,7 @@ class ViewerMonitor(QObject):
     def start(self, train_dir: Path):
         self.train_dir = Path(train_dir)
         self.is_active = True
-        self._last_files.clear()
+        self._last_state.clear()
         self.prepare_viewer()
         self._timer.start(self.get_poll_interval_ms())
         self._poll()
@@ -85,12 +85,35 @@ class ViewerMonitor(QObject):
             return
         
         try:
-            current_files = set(self.find_files())
-            if current_files != self._last_files:
-                self._last_files = current_files
-                files_list = sorted(current_files)
-                self.update_viewer(files_list)
-                self.files_found.emit(files_list)
+            found = self.find_files()
+            current_state = {f: f.stat().st_size for f in found if f.exists()}
+            
+            # Implementation of "Stable File" logic:
+            # We only notify when files have grown AND stayed the same size for 1 poll interval.
+            # This prevents trying to read a half-written .mha file.
+            stable_files = []
+            for f in found:
+                curr_size = current_state.get(f, 0)
+                last_size = self._last_state.get(f, -1)
+                
+                # If name is same and size is stable (> 0), it's safe to try reading
+                if curr_size > 0 and curr_size == last_size:
+                    stable_files.append(f)
+            
+            # If the set of files OR their sizes changed, we update our state.
+            # Decouple stability check from state-change check.
+            # This ensures that already-stable files (e.g. from a finished run) 
+            # are loaded on the second poll.
+            self._last_state = current_state
+            
+            # Use sorted tuple to check for meaningful changes in the stable file list
+            stable_tuple = tuple(sorted(stable_files))
+            if getattr(self, "_last_stable_tuple", None) != stable_tuple:
+                self._last_stable_tuple = stable_tuple
+                if stable_files:
+                    files_list = sorted(stable_files)
+                    self.update_viewer(files_list)
+                    self.files_found.emit(files_list)
         except Exception as e:
             self._log(f"Viewer monitor poll error in {self.__class__.__name__}: {e}")
     
@@ -117,8 +140,9 @@ class CTViewerMonitor(ViewerMonitor):
     # read_mha_volume + set_mha_volume on the GUI thread for every new file.
     _CT_VIEWER_DEBOUNCE_MS = 550
 
-    def __init__(self, viewer_widget, parent=None):
+    def __init__(self, viewer_widget, parent=None, dataset_type: str = "clinical"):
         super().__init__(viewer_widget, parent)
+        self.dataset_type = dataset_type
         self._phase_connected = False
         self._all_files = []
         self._last_overlays: Dict[str, str] = {}
@@ -158,12 +182,27 @@ class CTViewerMonitor(ViewerMonitor):
             return
 
         try:
-            current_ct_files = set(self.find_files())
-            if current_ct_files != self._last_files:
-                self._last_files = current_ct_files
-                self._ct_pending_paths = current_ct_files
-                self._ct_debounce.stop()
-                self._ct_debounce.start(self._CT_VIEWER_DEBOUNCE_MS)
+            found = self.find_files()
+            current_state = {f: f.stat().st_size for f in found if f.exists()}
+            
+            # Stability check for SPARE/MHA
+            stable_found = set()
+            for f in found:
+                curr_size = current_state.get(f, 0)
+                last_size = self._last_state.get(f, -1)
+                
+                # In clinical DICOM, we don't strictly need stability, but it doesn't hurt.
+                # In SPARE, it's critical.
+                if curr_size > 0 and curr_size == last_size:
+                    stable_found.add(f)
+
+            if current_state != self._last_state:
+                self._last_state = current_state
+                # Only debounce update if we have stable files to show
+                if stable_found:
+                    self._ct_pending_paths = stable_found
+                    self._ct_debounce.stop()
+                    self._ct_debounce.start(self._CT_VIEWER_DEBOUNCE_MS)
 
             current_overlays = self._scan_overlays()
             if current_overlays != self._last_overlays:
@@ -175,6 +214,10 @@ class CTViewerMonitor(ViewerMonitor):
     
     def prepare_viewer(self):
         try:
+            # For SPARE, if we already have a volume (from COPY preview), don't clear it.
+            if self.dataset_type == "spare" and hasattr(self.viewer, "is_volume_loaded") and self.viewer.is_volume_loaded():
+                return
+                
             self.viewer.prepare_for_volume_loading("Awaiting CT volumes...")
             from .ui.info_panels import CTInfoWidget
 
@@ -189,6 +232,12 @@ class CTViewerMonitor(ViewerMonitor):
     def find_files(self) -> list[Path]:
         if not self.train_dir or not self.train_dir.exists():
             return []
+        if self.dataset_type == "spare":
+            # In SPARE, look for CTs first, then any MHA
+            cts = list(self.train_dir.glob("CT_*.mha"))
+            if cts:
+                return cts
+            return list(self.train_dir.glob("*.mha"))
         return list(self.train_dir.glob("CT_*.mha"))
     
     def update_viewer(self, files: list[Path]):
@@ -252,16 +301,30 @@ class CTViewerMonitor(ViewerMonitor):
                 self._log(f"Phase file no longer exists: {file}", level="WARN")
                 return
 
-            # Check cache - now includes sitk_image
-            if file in self._volume_cache:
-                vol, spacing, origin, direction, sitk_img = self._volume_cache[file]
+            # Check cache - invalidate if file size changed
+            file_size = file.stat().st_size
+            cached_entry = self._volume_cache.get(file)
+            
+            should_reload = False
+            if not cached_entry:
+                should_reload = True
             else:
-                # read_mha_volume now returns 5 values including sitk image
-                vol, spacing, origin, direction, sitk_img = read_mha_volume(file)
-                self._volume_cache[file] = (vol, spacing, origin, direction, sitk_img)
+                # Entry 5 is the file size at time of caching
+                cached_size = cached_entry[5] if len(cached_entry) > 5 else 0
+                if file_size != cached_size:
+                    should_reload = True
+            
+            if should_reload:
+                res = read_mha_volume(file)
+                if res is None:
+                    return # Still stabilizing
+                vol, spacing, origin, direction, sitk_img = res
+                self._volume_cache[file] = (vol, spacing, origin, direction, sitk_img, file_size)
+            else:
+                vol, spacing, origin, direction, sitk_img, _ = self._volume_cache[file]
             
             # FIX: Pass sitk_image for geometry-accurate overlay resampling
-            self.viewer.set_mha_volume(vol, spacing, origin, direction, sitk_image=sitk_img)
+            self.viewer.set_mha_volume(vol, spacing, origin, direction, sitk_image=sitk_img, dataset_type=self.dataset_type)
             
             self.viewer.set_info(
                 source=f"MHA: {file.name}",
@@ -306,8 +369,8 @@ class DRRViewerMonitor(ViewerMonitor):
     # disk reads + pixmaps on the GUI thread in one shot (extra tabs keep monitors alive).
     _MAX_PROJECTIONS_PER_POLL = 28
 
-    def __init__(self, viewer_widget, parent=None):
-        super().__init__(viewer_widget, parent)
+    def __init__(self, viewer_widget, parent=None, **kwargs):
+        super().__init__(viewer_widget, parent=parent, **kwargs)
         self.frame_ready.connect(self.viewer.add_frame)
         self._drr_paths_ok: Set[Path] = set()
 
@@ -525,8 +588,8 @@ class DVFViewerMonitor(ViewerMonitor):
 
     _DVF_VIEWER_DEBOUNCE_MS = 650
 
-    def __init__(self, viewer_widget, mode: str = 'low', parent=None):
-        super().__init__(viewer_widget, parent)
+    def __init__(self, viewer_widget, mode: str = 'low', parent=None, **kwargs):
+        super().__init__(viewer_widget, parent=parent, **kwargs)
         self.mode = mode
         self._source_mha_path: Optional[Path] = None
         self._dvf_debounce = QTimer(self)
@@ -553,12 +616,26 @@ class DVFViewerMonitor(ViewerMonitor):
         if not self.is_active or not self.train_dir or not self.train_dir.exists():
             return
         try:
-            current = set(self.find_files())
-            if current != self._last_files:
-                self._last_files = current
-                self._dvf_pending_files = current
-                self._dvf_debounce.stop()
-                self._dvf_debounce.start(self._DVF_VIEWER_DEBOUNCE_MS)
+            found = self.find_files()
+            current_state = {f: f.stat().st_size for f in found if f.exists()}
+            
+            stable_found = set()
+            for f in found:
+                curr_size = current_state.get(f, 0)
+                last_size = self._last_state.get(f, -1)
+                if curr_size > 0 and curr_size == last_size:
+                    stable_found.add(f)
+
+            # Decouple stability check from state-change check.
+            self._last_state = current_state
+            
+            stable_tuple = tuple(sorted(stable_found))
+            if getattr(self, "_last_stable_tuple", None) != stable_tuple:
+                self._last_stable_tuple = stable_tuple
+                if stable_found:
+                    self._dvf_pending_files = stable_found
+                    self._dvf_debounce.stop()
+                    self._dvf_debounce.start(self._DVF_VIEWER_DEBOUNCE_MS)
         except Exception as e:
             self._log(f"DVFViewerMonitor poll error: {e}")
 
@@ -574,7 +651,8 @@ class DVFViewerMonitor(ViewerMonitor):
             if not self._source_mha_path.exists():
                 self._source_mha_path = self.train_dir / "source.mha"
             if not self._source_mha_path.exists():
-                all_subs = sorted(list(self.train_dir.glob("sub_CT_*.mha")))
+                # Flexible fallback for SPARE or custom naming
+                all_subs = sorted(list(self.train_dir.glob("sub_*.mha")))
                 if all_subs:
                     self._source_mha_path = all_subs[0]
                 else:
@@ -585,8 +663,14 @@ class DVFViewerMonitor(ViewerMonitor):
             if not self._source_mha_path.exists():
                 self._source_mha_path = self.train_dir / "CT_06.mha"
             if not self._source_mha_path.exists():
-                all_full = sorted(list(self.train_dir.glob("CT_*.mha")))
-                if all_full:
+                # Flexible fallback for SPARE or custom naming
+                all_full = sorted(list(self.train_dir.glob("*.mha")))
+                # Filter out masks if possible
+                mhas = [f for f in all_full if "Mask" not in f.name and "GTVol" not in f.name]
+                if mhas:
+                    self._source_mha_path = mhas[0]
+                elif all_full:
+                    # Fallback to absolute first if no CT name found
                     self._source_mha_path = all_full[0]
                 else:
                     self._source_mha_path = None
@@ -643,6 +727,9 @@ def create_viewer_monitor(viewer_type: str, viewer_widget, parent=None) -> Viewe
     monitor_class = monitors.get(viewer_type.lower(), NoViewerMonitor)
     
     kwargs = {}
+    if parent and hasattr(parent, 'dataset_type'):
+        kwargs['dataset_type'] = parent.dataset_type
+
     if monitor_class == DVFViewerMonitor:
         if parent and hasattr(parent, '_active_step_name'):
             if parent._active_step_name == 'DVF3D_FULL':

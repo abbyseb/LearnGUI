@@ -137,8 +137,9 @@ class WorkerBackedStepManager(StepManager):
     _step_key: str = "STEP"
     _status_when_done_text: str = "Complete."
 
-    def __init__(self, parent=None):
+    def __init__(self, dataset_type: str = "clinical", parent=None):
         super().__init__(parent)
+        self.dataset_type = dataset_type
         self._worker = None
 
     def _poll(self):
@@ -231,10 +232,12 @@ class CopyStepManager(StepManager):
         rt_list: Optional[List] = None,
         src_base: str = "",
         dst_base: Path | str = "",
+        dataset_type: str = "clinical",
         parent=None,
     ):
         super().__init__(parent)
         self.total_dicoms = int(total_dicoms)
+        self.dataset_type = dataset_type
         self.patient_id = patient_id or ""
         self.rt_list = list(rt_list or [])
         self.src_base = str(src_base or "")
@@ -261,7 +264,10 @@ class CopyStepManager(StepManager):
         self._last_copy_ft_reported = -2
         super().start(train_dir)
         self._start_copy_worker()
-        self._start_dicom_preview()
+        # For clinical: start DICOM carousel preview during copy
+        # For SPARE: MHA triptych is loaded AFTER copy completes (see _on_copy_worker_finished)
+        if self.dataset_type != "spare":
+            self._start_dicom_preview()
     
     def _disconnect_copy_worker(self) -> None:
         w = self._copy_worker
@@ -291,6 +297,17 @@ class CopyStepManager(StepManager):
 
     def _cleanup_dicom_preview_ui(self) -> None:
         controller = self.parent()
+        # For SPARE, the triptych was loaded directly — don't clear it
+        if self.dataset_type == "spare":
+            # Just stop the preview engine if any
+            if self._preview_engine:
+                try:
+                    self._preview_engine.stop()
+                except Exception:
+                    pass
+                self._preview_engine = None
+            return
+        
         if hasattr(controller, "win"):
             viewer = controller.win.tab2d.ct_quad
             if hasattr(viewer, "info_panel"):
@@ -337,7 +354,7 @@ class CopyStepManager(StepManager):
         """Progress bar follows all files; detail line shows files + DICOMs on disk."""
         if not self.train_dir:
             return
-        d_arrived = max(0, self._count_dicoms(self.train_dir) - self.baseline_count)
+        d_arrived = max(0, self._count_dicoms(self.train_dir, self.dataset_type) - self.baseline_count)
         d_exp = max(0, self.total_dicoms)
         fd, ft = self._files_done, self._files_total
         self.progress_detail.emit(fd, ft, d_arrived, d_exp)
@@ -363,6 +380,11 @@ class CopyStepManager(StepManager):
         self.is_active = False
         self._timer.stop()
         self._cleanup_dicom_preview_ui()
+        
+        # For SPARE: load MHA triptych NOW that files are in train_dir
+        if self.dataset_type == "spare":
+            self._start_mha_volume_preview()
+        
         self.progress_updated.emit(100, "Copy complete.")
         self.step_complete.emit()
 
@@ -414,6 +436,76 @@ class CopyStepManager(StepManager):
         self._copy_worker.failed.connect(self._on_copy_worker_failed)
         self._copy_worker.start()
     
+    def _start_mha_volume_preview(self):
+        """For SPARE: load first MHA directly into CTQuadPanel triptych (3-panel view)."""
+        c = self.parent()
+        def _log(msg):
+            if c and hasattr(c, 'log'):
+                c.log(msg)
+            print(msg)
+        
+        try:
+            import SimpleITK as sitk
+            import numpy as np
+            
+            _log(f"DEBUG: _start_mha_volume_preview called. train_dir={self.train_dir}")
+            
+            controller = self.parent()
+            if not hasattr(controller, 'win'):
+                _log("DEBUG: MHA preview: no controller.win — aborting")
+                return
+            viewer = controller.win.tab2d.ct_quad
+            
+            # Find MHA files in train_dir
+            if not self.train_dir:
+                _log("DEBUG: MHA preview: train_dir is None — aborting")
+                return
+            if not self.train_dir.exists():
+                _log(f"DEBUG: MHA preview: train_dir does not exist: {self.train_dir}")
+                return
+            
+            mha_files = sorted(self.train_dir.glob('*.mha'))
+            _log(f"DEBUG: MHA preview: found {len(mha_files)} .mha files in {self.train_dir}")
+            if not mha_files:
+                return
+            
+            # Pick the first volume (typically a CT or GTVol)
+            mha_path = mha_files[0]
+            _log(f"INFO: Loading MHA preview: {mha_path.name} ({mha_path.stat().st_size / 1e6:.1f} MB)")
+            
+            img = sitk.ReadImage(str(mha_path))
+            arr = sitk.GetArrayFromImage(img).astype(np.float32)
+            spacing = img.GetSpacing()  # (sx, sy, sz) in ITK order
+            spacing_zyx = (float(spacing[2]), float(spacing[1]), float(spacing[0]))
+            _log(f"DEBUG: MHA read OK. shape={arr.shape}, spacing_zyx={spacing_zyx}")
+            
+            viewer.set_mha_volume(
+                arr, spacing_zyx,
+                origin=img.GetOrigin(),
+                direction=img.GetDirection(),
+                sitk_image=img
+            )
+            _log("DEBUG: set_mha_volume() completed — triptych should be visible")
+            
+            # Update info to show which volume is displayed
+            z, y, x = arr.shape
+            viewer.set_info(
+                source=mha_path.name,
+                dims=f"{z} × {y} × {x}",
+                vox=f"{spacing_zyx[0]:.3f}, {spacing_zyx[1]:.3f}, {spacing_zyx[2]:.3f}",
+                count=str(len(mha_files)),
+            )
+            
+            # If there are multiple MHA files, populate the phase selector
+            if len(mha_files) > 1 and hasattr(viewer, 'set_phase_options'):
+                names = [p.stem for p in mha_files]
+                viewer.set_phase_options(names, 0)
+            
+        except Exception as e:
+            _log(f"ERROR: MHA volume preview failed: {e}")
+            import traceback
+            traceback.print_exc()
+
     def _start_dicom_preview(self):
         """Start efficient DICOM preview engine."""
         try:
@@ -478,26 +570,10 @@ class CopyStepManager(StepManager):
             viewer.info_panel.update_dicom_preview_series(list(opts))
     
     @staticmethod
-    def _count_dicoms(path: Path) -> int:
-        """Count DICOM files recursively. Must match count_dicoms_recursive logic."""
-        if not path.exists():
-            return 0
-        count = 0
-        for p in path.rglob("*"):
-            if not p.is_file():
-                continue
-            ext = p.suffix.lower()
-            if ext in {".dcm", ".dicom", ".ima"}:
-                count += 1
-            elif ext == "" or ext not in (".txt", ".mha", ".mhd", ".xml", ".json"):
-                try:
-                    with open(p, "rb") as fh:
-                        fh.seek(128)
-                        if fh.read(4) == b"DICM":
-                            count += 1
-                except Exception:
-                    pass
-        return count
+    def _count_dicoms(path: Path, dataset_type: str = "clinical") -> int:
+        """Count source files recursively (DICOMs or MHAs)."""
+        from .run_preparation import count_dicoms_recursive
+        return count_dicoms_recursive(path, dataset_type)
 
 
 class DICOM2MHAStepManager(WorkerBackedStepManager):
@@ -508,10 +584,12 @@ class DICOM2MHAStepManager(WorkerBackedStepManager):
 
     progress_detail = pyqtSignal(int, int, int, int)  # ct_done, ct_total, struct_done, struct_total
 
+    def __init__(self, dataset_type: str = "clinical", parent=None):
+        super().__init__(dataset_type=dataset_type, parent=parent)
+
     def _create_worker(self):
         from .workers import Dicom2MhaWorker
-
-        return Dicom2MhaWorker(self.train_dir, parent=self)
+        return Dicom2MhaWorker(self.train_dir, dataset_type=self.dataset_type, parent=self)
 
     def get_viewer_type(self) -> Optional[str]:
         return 'ct'
@@ -565,6 +643,8 @@ class DICOM2MHAStepManager(WorkerBackedStepManager):
         return ct_created >= ct_expected
     
     def format_status(self, created: int, total: int) -> str:
+        if self.dataset_type == "spare":
+            return "Normalizing Nomenclature (GTVol → CT)..."
         if total == -1:
             return "Converting DICOM → MHA... (scanning)"
         return "Converting DICOM → MHA..."
@@ -594,10 +674,12 @@ class DownsampleStepManager(WorkerBackedStepManager):
 
     progress_detail = pyqtSignal(int, int)  # created, total
 
+    def __init__(self, dataset_type: str = "clinical", parent=None):
+        super().__init__(dataset_type=dataset_type, parent=parent)
+
     def _create_worker(self):
         from .workers import DownsampleWorker
-
-        return DownsampleWorker(self.train_dir, parent=self)
+        return DownsampleWorker(self.train_dir, dataset_type=self.dataset_type, parent=self)
 
     def get_viewer_type(self) -> Optional[str]:
         return None  # Keep previous viewer
@@ -634,20 +716,21 @@ class DRRStepManager(WorkerBackedStepManager):
 
     _step_key = "DRR"
     _status_when_done_text = "DRR generation complete."
-
     _proj_cache: Optional[int] = None
 
-    progress_detail = pyqtSignal(str)  # Detailed status like "CT_01/10 • 120/720"
+    progress_detail = pyqtSignal(str)  # detail text
 
     def __init__(
         self,
         geom_path: Path | str | None = None,
         drr_opts: dict | None = None,
+        dataset_type: str = "clinical",
         parent=None,
     ):
-        super().__init__(parent)
+        super().__init__(dataset_type=dataset_type, parent=parent)
         self._geom_path = geom_path
         self._drr_opts = dict(drr_opts or {})
+        self.dataset_type = dataset_type
 
     def _default_geom_path(self) -> Path:
         return Path(__file__).resolve().parents[1] / "modules" / "drr_generation" / "RTKGeometry_360.xml"
@@ -659,7 +742,7 @@ class DRRStepManager(WorkerBackedStepManager):
         if not gp:
             gp = self._default_geom_path()
         return DrrWorker(
-            self.train_dir, Path(gp), drr_opts=self._drr_opts, parent=self
+            self.train_dir, Path(gp), drr_opts=self._drr_opts, dataset_type=self.dataset_type, parent=self
         )
 
     @property
@@ -755,10 +838,12 @@ class CompressStepManager(WorkerBackedStepManager):
 
     progress_detail = pyqtSignal(int, int)  # created, total
 
+    def __init__(self, dataset_type: str = "clinical", parent=None):
+        super().__init__(dataset_type=dataset_type, parent=parent)
+
     def _create_worker(self):
         from .workers import CompressWorker
-
-        return CompressWorker(self.train_dir, parent=self)
+        return CompressWorker(self.train_dir, dataset_type=self.dataset_type, parent=self)
 
     @property
     def projections_per_ct(self) -> int:
@@ -796,9 +881,11 @@ class DVF2DStepManager(WorkerBackedStepManager):
     _step_key = "DVF2D"
     _status_when_done_text = "2D DVF step finished."
 
+    def __init__(self, dataset_type: str = "clinical", parent=None):
+        super().__init__(dataset_type=dataset_type, parent=parent)
+
     def _create_worker(self):
         from .workers import Dvf2DWorker
-
         return Dvf2DWorker(self.train_dir, parent=self)
 
     def get_viewer_type(self) -> Optional[str]:
@@ -842,10 +929,12 @@ class DVF3DLowStepManager(WorkerBackedStepManager):
 
     progress_detail = pyqtSignal(int, int)  # created, total
 
+    def __init__(self, dataset_type: str = "clinical", parent=None):
+        super().__init__(dataset_type=dataset_type, parent=parent)
+
     def _create_worker(self):
         from .workers import Dvf3DWorker
-
-        return Dvf3DWorker(self.train_dir, low_res=True, parent=self)
+        return Dvf3DWorker(self.train_dir, low_res=True, dataset_type=self.dataset_type, parent=self)
 
     def get_viewer_type(self) -> Optional[str]:
         return 'dvf'
@@ -880,14 +969,16 @@ class DVF3DFullStepManager(WorkerBackedStepManager):
     """3D DVF (full-res) via Dvf3DWorker."""
 
     _step_key = "DVF3D_FULL"
-    _status_when_done_text = "3D DVF (full res) complete."
+    _status_when_done_text = "3D DVF (full-res) complete."
 
     progress_detail = pyqtSignal(int, int)  # created, total
 
+    def __init__(self, dataset_type: str = "clinical", parent=None):
+        super().__init__(dataset_type=dataset_type, parent=parent)
+
     def _create_worker(self):
         from .workers import Dvf3DWorker
-
-        return Dvf3DWorker(self.train_dir, low_res=False, parent=self)
+        return Dvf3DWorker(self.train_dir, low_res=False, dataset_type=self.dataset_type, parent=self)
 
     def get_viewer_type(self) -> Optional[str]:
         return 'dvf'
@@ -921,15 +1012,13 @@ class DVF3DFullStepManager(WorkerBackedStepManager):
 
 
 class KVPreprocessStepManager(WorkerBackedStepManager):
-    """kV test copy + process via KvPreprocessWorker."""
+    """kV image preprocessing (extract test data, reference source.mha)."""
 
     _step_key = "KV_PREPROCESS"
-    _status_when_done_text = "kV preprocessing complete."
+    _status_when_done_text = "kV Preprocessing complete."
 
-    progress_detail = pyqtSignal(int, int)  # copied/processed, total_fractions
-
-    def __init__(self, rt_ct_pres_list: list, base_dir: str, parent=None):
-        super().__init__(parent)
+    def __init__(self, rt_ct_pres_list: list, base_dir: str, dataset_type: str = "clinical", parent=None):
+        super().__init__(dataset_type=dataset_type, parent=parent)
         self.rt_ct_pres_list = rt_ct_pres_list
         self.base_dir = base_dir
         self.total_fractions = 0

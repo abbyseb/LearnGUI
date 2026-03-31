@@ -10,7 +10,7 @@ Design principles:
 """
 from __future__ import annotations
 from pathlib import Path
-from typing import Optional, Dict, List, TYPE_CHECKING
+from typing import Optional, Dict, List, TYPE_CHECKING, Any, Union
 from collections import deque, defaultdict
 import numpy as np
 import time
@@ -30,6 +30,16 @@ except ImportError:
 except Exception:
     pydicom = None
     def is_dicom(_): return False
+
+try:
+    import SimpleITK as sitk
+except ImportError:
+    sitk = None
+
+try:
+    from scipy.ndimage import zoom
+except ImportError:
+    zoom = None
 
 
 # ============================================================================
@@ -116,6 +126,111 @@ class DicomSlice:
         return self._pixels is not None
 
 
+class MHAVolume:
+    """Previewer for MHA volumes (generates 3-plane MPR view).
+    
+    Handles partially-written files during COPY by checking file size stability
+    before reading, and allows retries on subsequent frames.
+    """
+    __slots__ = ('path', 'instance_number', 'rows', 'cols', 
+                 'series_uid', '_pixels', 'last_access', 'is_mha',
+                 '_read_attempts', '_last_file_size')
+    
+    MAX_READ_ATTEMPTS = 10  # Stop retrying after this many failures
+    
+    def __init__(self, path: Path):
+        self.path = path
+        self.instance_number = 0
+        self.series_uid = path.name  # Use filename as series UID for distinct selection
+        self.rows = 0
+        self.cols = 0
+        self._pixels = None
+        self.last_access = 0.0
+        self.is_mha = True
+        self._read_attempts = 0
+        self._last_file_size = -1
+    
+    def _is_file_stable(self) -> bool:
+        """Check if the file has stopped growing (i.e., copy is complete)."""
+        try:
+            size = self.path.stat().st_size
+            if size == 0:
+                return False
+            if size != self._last_file_size:
+                self._last_file_size = size
+                return False  # Size changed since last check — still being written
+            return True  # Same size as last check
+        except (OSError, FileNotFoundError):
+            return False
+    
+    def get_pixels(self) -> np.ndarray:
+        self.last_access = time.time()
+        if self._pixels is not None:
+            return self._pixels
+        
+        if sitk is None:
+            return np.zeros((1, 1), dtype=np.float32)
+        
+        # Don't attempt if we've exhausted retries
+        if self._read_attempts >= self.MAX_READ_ATTEMPTS:
+            return np.zeros((1, 1), dtype=np.float32)
+        
+        # Check file is stable (not still being written from COPY)
+        if not self._is_file_stable():
+            return np.zeros((1, 1), dtype=np.float32)
+        
+        self._read_attempts += 1
+        
+        try:
+            img = sitk.ReadImage(str(self.path))
+            arr = sitk.GetArrayFromImage(img)  # (Z, Y, X)
+            
+            if arr.ndim != 3:
+                self._pixels = arr.astype(np.float32)
+            else:
+                z, y, x = arr.shape
+                axial    = arr[z // 2, :, :].astype(np.float32)   # (Y, X)
+                coronal  = arr[:, y // 2, :].astype(np.float32)   # (Z, X)
+                sagittal = arr[:, :, x // 2].astype(np.float32)   # (Z, Y)
+                
+                # Pad all planes to the same height (max of Y, Z)
+                target_h = max(y, z)
+                
+                def _pad_to_h(plane, target):
+                    h, w = plane.shape
+                    if h >= target:
+                        return plane
+                    pad_top = (target - h) // 2
+                    pad_bot = target - h - pad_top
+                    return np.pad(plane, ((pad_top, pad_bot), (0, 0)),
+                                  mode='constant', constant_values=float(plane.min()))
+                
+                ax_p = _pad_to_h(axial, target_h)
+                co_p = _pad_to_h(coronal, target_h)
+                sa_p = _pad_to_h(sagittal, target_h)
+                
+                # 2px dark separator columns between views
+                sep = np.full((target_h, 2), float(ax_p.min()), dtype=np.float32)
+                self._pixels = np.hstack([ax_p, sep, co_p, sep, sa_p])
+            
+            self.rows, self.cols = self._pixels.shape
+            return self._pixels
+            
+        except Exception:
+            # File may still be incomplete (copy in progress) — allow retry
+            # by NOT setting self._pixels
+            return np.zeros((1, 1), dtype=np.float32)
+
+    def clear_cache(self):
+        self._pixels = None
+        self._read_attempts = 0  # Reset retries on cache clear
+        self._last_file_size = -1
+
+    @property
+    def is_loaded(self) -> bool:
+        return self._pixels is not None
+
+
 # ============================================================================
 # DICOM PREVIEW ENGINE
 # ============================================================================
@@ -156,10 +271,10 @@ class DICOMPreviewEngine(QObject):
         self._known_paths: set[Path] = set()
         self._processing_queue: deque[Path] = deque() 
         self._retry_counts: Dict[Path, int] = {}
-        self._slices: Dict[Path, DicomSlice] = {}
+        self._slices: Dict[Path, Any] = {}
         
         # Series grouping
-        self._series_map: Dict[str, List[DicomSlice]] = defaultdict(list)
+        self._series_map: Dict[str, List[Any]] = defaultdict(list)
         self._active_uid: Optional[str] = None
         self._manual_series_lock = False  # True after user picks a series in the COPY helper
         self._catalog_timer = QTimer(self)
@@ -167,8 +282,9 @@ class DICOMPreviewEngine(QObject):
         self._catalog_timer.timeout.connect(self._emit_series_catalog)
         
         # Sorting
-        self._sorted_slices: List[DicomSlice] = []
+        self._sorted_slices: List[Any] = []
         self._sorted_valid = True
+        self._volume_valid = False
         
         # Volume for MPR
         self._volume: Optional[np.ndarray] = None
@@ -241,8 +357,13 @@ class DICOMPreviewEngine(QObject):
         opts: List[tuple[str, str]] = []
         for uid, slices in sorted(self._series_map.items(), key=lambda kv: -len(kv[1])):
             n = len(slices)
-            short = f"{uid[:10]}…" if len(uid) > 12 else uid
-            opts.append((f"{n} slices · {short}", uid))
+            # Check if this is an MHA volume (uid == filename)
+            is_mha = any(getattr(s, 'is_mha', False) for s in slices)
+            if is_mha:
+                opts.append((f"Volume · {uid}", uid))
+            else:
+                short = f"{uid[:10]}…" if len(uid) > 12 else uid
+                opts.append((f"{n} slices · {short}", uid))
         self.series_catalog_changed.emit(opts)
 
     def _schedule_emit_catalog(self) -> None:
@@ -271,6 +392,8 @@ class DICOMPreviewEngine(QObject):
                 
                 if ext in {".dcm", ".dicom", ".ima"}:
                     is_valid = True
+                elif ext == ".mha":
+                    is_valid = True
                 elif ext == "" or ext.isdigit(): # Handle extensionless or numeric extensions
                     try:
                         with open(p, 'rb') as f:
@@ -295,25 +418,29 @@ class DICOMPreviewEngine(QObject):
     # SLICE MANAGEMENT
     # ========================================================================
     
-    def _ensure_slice(self, path: Path) -> Optional[DicomSlice]:
-        """Get or create DicomSlice (reads header only)."""
+    def _ensure_slice(self, path: Path) -> Optional[Union[DicomSlice, MHAVolume]]:
+        """Get or create DicomSlice or MHAVolume (reads header/first load)."""
         if path in self._slices:
             return self._slices[path]
         
-        if pydicom is None:
-            return None
-
         try:
-            ds = pydicom.dcmread(str(path), stop_before_pixels=True, force=True)
-            
-            # Verify it's CT or fallback if missing
-            modality = str(getattr(ds, 'Modality', 'CT')).upper()
-            if modality not in {'CT', 'MR', 'RTDOSE', 'RTSTRUCT', 'RTPLAN', 'PT'}:
-                # If it's a known non-image type or completely wrong, skip
-                if any(x in modality for x in {'REPORT', 'SR', 'KO', 'PR'}):
-                    return None
-            
-            sl = DicomSlice(path, ds)
+            if path.suffix.lower() == ".mha":
+                sl = MHAVolume(path)
+                # To get rows/cols, we need to load once or just wait
+                # MHASlice is lazy, let's just use it
+            elif pydicom is not None:
+                ds = pydicom.dcmread(str(path), stop_before_pixels=True, force=True)
+                
+                # Verify it's CT or fallback if missing
+                modality = str(getattr(ds, 'Modality', 'CT')).upper()
+                if modality not in {'CT', 'MR', 'RTDOSE', 'RTSTRUCT', 'RTPLAN', 'PT'}:
+                    # If it's a known non-image type or completely wrong, skip
+                    if any(x in modality for x in {'REPORT', 'SR', 'KO', 'PR'}):
+                        return None
+                
+                sl = DicomSlice(path, ds)
+            else:
+                return None
 
             self._slices[path] = sl
             
@@ -358,7 +485,7 @@ class DICOMPreviewEngine(QObject):
         for sl in loaded[:to_clear]:
             sl.clear_cache()
     
-    def _get_sorted_slices(self) -> List[DicomSlice]:
+    def _get_sorted_slices(self) -> List[Any]:
         """Get slices sorted by instance number for the ACTIVE series only."""
         if not self._sorted_valid:
             eff = self._effective_active_uid()
@@ -471,6 +598,10 @@ class DICOMPreviewEngine(QObject):
             if pixels is None:
                 return
             
+            # Skip rendering 1×1 fallback (incomplete MHA, still being copied)
+            if pixels.shape[0] <= 1 or pixels.shape[1] <= 1:
+                return
+            
             if not self._auto_windowed:
                 self._wl, self._ww = _auto_window(pixels)
                 self._auto_windowed = True
@@ -498,13 +629,24 @@ class DICOMPreviewEngine(QObject):
                 sa_pm = _array_to_pixmap(sa_u8)
             
             # Info
-            info = {
-                'source': f"DICOM: {sl.path.name}",
-                'dims': f"{len(slices)} × {sl.rows} × {sl.cols}",
-                'vox': (f"{sl.slice_thickness:.3f}, {sl.pixel_spacing[0]:.3f}, {sl.pixel_spacing[1]:.3f}"
-                        if sl.pixel_spacing else "—"),
-                'count': str(len(slices)),
-            }
+            is_mha = getattr(sl, 'is_mha', False)
+            type_label = "MHA" if is_mha else "DICOM"
+            
+            if is_mha:
+                info = {
+                    'source': f"{type_label}: {sl.path.name}",
+                    'dims': f"{sl.rows} × {sl.cols}",
+                    'vox': "—",
+                    'count': str(len(slices)),
+                }
+            else:
+                info = {
+                    'source': f"{type_label}: {sl.path.name}",
+                    'dims': f"{len(slices)} × {sl.rows} × {sl.cols}",
+                    'vox': (f"{sl.slice_thickness:.3f}, {sl.pixel_spacing[0]:.3f}, {sl.pixel_spacing[1]:.3f}"
+                            if getattr(sl, 'pixel_spacing', None) else "—"),
+                    'count': str(len(slices)),
+                }
             
             self.frame_ready.emit(ax_pm, co_pm, sa_pm, info)
             
