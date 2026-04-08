@@ -133,9 +133,110 @@ class OverlayLabel(QLabel):
         p.end()
 
 
+# =========================
+# Decentralized Viewer Pane
+# =========================
+
+class CTPane(QWidget):
+    """
+    A single viewer pane containing a control header (dropdown + rotation),
+    the image label, and a slice slider.
+    """
+    settings_changed = pyqtSignal()
+    slice_changed = pyqtSignal(int)
+
+    def __init__(self, axis_index: int, default_name="Axial"):
+        super().__init__()
+        self.layout = QVBoxLayout(self)
+        self.layout.setContentsMargins(0, 0, 0, 0)
+        self.layout.setSpacing(2)
+
+        # 1. Header Bar
+        self.header = QWidget()
+        self.header.setStyleSheet("background-color: #222; border-bottom: 1px solid #444;")
+        h_lay = QHBoxLayout(self.header)
+        h_lay.setContentsMargins(4, 2, 4, 2)
+        h_lay.setSpacing(4)
+
+        self.cmb_view = QComboBox()
+        self.cmb_view.addItems(["Axial", "Coronal", "Sagittal"])
+        self.cmb_view.setCurrentText(default_name)
+        # styling to make it small
+        self.cmb_view.setStyleSheet("QComboBox { font-size: 10px; padding: 1px; }")
+        
+        self.btn_ccw = QPushButton("↺")
+        self.btn_cw = QPushButton("↻")
+        self.btn_flip_h = QPushButton("↔")
+        self.btn_flip_v = QPushButton("↕")
+        
+        for b in (self.btn_ccw, self.btn_cw, self.btn_flip_h, self.btn_flip_v):
+            b.setFixedSize(22, 18)
+            b.setStyleSheet("font-size: 10px; padding: 0px;")
+
+        h_lay.addWidget(self.cmb_view)
+        h_lay.addStretch()
+        h_lay.addWidget(self.btn_ccw)
+        h_lay.addWidget(self.btn_cw)
+        h_lay.addWidget(self.btn_flip_h)
+        h_lay.addWidget(self.btn_flip_v)
+
+        # 2. Image Label
+        self.lbl = OverlayLabel(alignment=Qt.AlignmentFlag.AlignCenter)
+        self.lbl.setStyleSheet("background-color:#000; border:0; border-radius:0;")
+        self.lbl.setMinimumSize(64, 64)
+        self.lbl.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+
+        # 3. Slider
+        self.sld = QSlider(Qt.Orientation.Horizontal)
+        self.sld.setEnabled(False)
+        self.sld.setMinimum(0)
+        self.sld.setMaximum(0)
+        self.sld.setStyleSheet("QSlider::handle:horizontal { height: 10px; width: 10px; }")
+
+        self.layout.addWidget(self.header)
+        self.layout.addWidget(self.lbl, 1)
+        self.layout.addWidget(self.sld)
+
+        # Pane State
+        self.axis_index = axis_index
+        self.rotation_k = 0  # 0-3
+        self.flip_h = False
+        self.flip_v = False
+
+        # Connections
+        self.cmb_view.currentTextChanged.connect(lambda _: self.settings_changed.emit())
+        self.btn_ccw.clicked.connect(self._rotate_ccw)
+        self.btn_cw.clicked.connect(self._rotate_cw)
+        self.btn_flip_h.clicked.connect(self._toggle_flip_h)
+        self.btn_flip_v.clicked.connect(self._toggle_flip_v)
+        self.sld.valueChanged.connect(self.slice_changed.emit)
+
+    def _rotate_ccw(self):
+        self.rotation_k = (self.rotation_k + 1) % 4
+        self.settings_changed.emit()
+
+    def _rotate_cw(self):
+        self.rotation_k = (self.rotation_k - 1) % 4
+        self.settings_changed.emit()
+
+    def _toggle_flip_h(self):
+        self.flip_h = not self.flip_h
+        self.settings_changed.emit()
+
+    def _toggle_flip_v(self):
+        self.flip_v = not self.flip_v
+        self.settings_changed.emit()
+
+    @property
+    def view_type(self) -> str:
+        return self.cmb_view.currentText()
+
+    def set_view_type(self, vt: str):
+        self.cmb_view.setCurrentText(vt)
+
 
 # =========================
-# CT Triptych (Unchanged)
+# CT Triptych
 # =========================
 class CTQuadPanel(QGroupBox):
     """
@@ -154,46 +255,35 @@ class CTQuadPanel(QGroupBox):
         self.grid.setHorizontalSpacing(6)
         self.grid.setVerticalSpacing(6)
 
-        # Image panels
-        self.lbl_co = OverlayLabel(alignment=Qt.AlignmentFlag.AlignCenter)
-        self.lbl_ax = OverlayLabel(alignment=Qt.AlignmentFlag.AlignCenter)
-        self.lbl_sa = OverlayLabel(alignment=Qt.AlignmentFlag.AlignCenter)
-        for lbl, name in ((self.lbl_co, "Coronal"), (self.lbl_ax, "Axial"), (self.lbl_sa, "Sagittal")):
-            lbl.setStyleSheet("background-color:#000; border:0; border-radius:0;")
-            lbl.setAutoFillBackground(True)
-            lbl.set_bl_text(name)
-            lbl.setMinimumSize(24, 24)
-            lbl.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-
-        # Sliders
-        self.sld_ax = QSlider(Qt.Orientation.Horizontal); self.sld_ax.setEnabled(False)
-        self.sld_co = QSlider(Qt.Orientation.Horizontal); self.sld_co.setEnabled(False)
-        self.sld_sa = QSlider(Qt.Orientation.Horizontal); self.sld_sa.setEnabled(False)
-        for s in (self.sld_ax, self.sld_co, self.sld_sa):
-            s.setMinimum(0); s.setMaximum(0); s.setSingleStep(1); s.setPageStep(8); s.setTracking(True)
-
-        # Wraps
-        self._ax_wrap = QWidget(); v_ax = QVBoxLayout(self._ax_wrap); v_ax.setContentsMargins(0,0,0,0); v_ax.addWidget(self.lbl_ax, 1); v_ax.addWidget(self.sld_ax)
-        self._co_wrap = QWidget(); v_co = QVBoxLayout(self._co_wrap); v_co.setContentsMargins(0,0,0,0); v_co.addWidget(self.lbl_co, 1); v_co.addWidget(self.sld_co)
-        self._sa_wrap = QWidget(); v_sa = QVBoxLayout(self._sa_wrap); v_sa.setContentsMargins(0,0,0,0); v_sa.addWidget(self.lbl_sa, 1); v_sa.addWidget(self.sld_sa)
+        # Image panes (Fixed to logical indices 0, 1, 2)
+        self.pane_ax = CTPane(axis_index=0, default_name="Axial")
+        self.pane_co = CTPane(axis_index=1, default_name="Coronal")
+        self.pane_sa = CTPane(axis_index=2, default_name="Sagittal")
+        
+        self._axis_to_name = {0: "Axial", 1: "Coronal", 2: "Sagittal"}
+        
+        # Backward compatibility aliases (to minimize diffs in rendering code for now)
+        self.lbl_ax = self.pane_ax.lbl
+        self.lbl_co = self.pane_co.lbl
+        self.lbl_sa = self.pane_sa.lbl
+        self.sld_ax = self.pane_ax.sld
+        self.sld_co = self.pane_co.sld
+        self.sld_sa = self.pane_sa.sld
 
         # --- Info Panel (Refactored) ---
-        # If a child class provides a widget, use it. Otherwise default to CTInfoWidget.
         if custom_info_widget:
             self.info_panel = custom_info_widget
         else:
             self.info_panel = CTInfoWidget()
-            # Connect specific CT signals
             self.info_panel.phase_changed.connect(self.series_changed.emit)
             self.info_panel.overlay_changed.connect(self.set_overlay)
-            self.info_panel.flip_changed.connect(self._update_triptych)
-            # FIX: Default to DICOM preview mode (simpler info panel on startup)
+            # Connectivity cleanup: global orientation/rotation removed from UI
             self.info_panel.set_preview_mode(True)
 
-        # Sliders Logic
-        self.sld_ax.valueChanged.connect(self._on_slice_changed)
-        self.sld_co.valueChanged.connect(self._on_slice_changed)
-        self.sld_sa.valueChanged.connect(self._on_slice_changed)
+        # Connect Pane signals
+        for p in (self.pane_ax, self.pane_co, self.pane_sa):
+            p.settings_changed.connect(self._on_pane_settings_changed)
+            p.slice_changed.connect(self._on_slice_changed)
 
         # Layout
         self._apply_layout_single()
@@ -226,6 +316,9 @@ class CTQuadPanel(QGroupBox):
         self._dataset_type = "clinical"
         self._perm_phys_to_log: tuple[int,int,int] | None = None
         self._spacing_SAR: tuple[float,float,float] | None = None
+        self._vol_SAR: np.ndarray | None = None
+        self._orientation_token: str = "S-A-R"
+        self._rotate_k: int = 0
 
     # ---------------- layout helpers ----------------
     def _clear_grid(self):
@@ -235,34 +328,32 @@ class CTQuadPanel(QGroupBox):
             if w: self.grid.removeWidget(w)
 
     def _apply_layout_single(self):
-        self._co_wrap.setVisible(False)
-        self._sa_wrap.setVisible(False)
+        self.pane_co.setVisible(False)
+        self.pane_sa.setVisible(False)
 
         self._clear_grid()
-        self.grid.addWidget(self._ax_wrap,   0, 0, 2, 1)
-        self.grid.addWidget(self.info_panel, 0, 1, 2, 1) # Use self.info_panel
+        self.grid.addWidget(self.pane_ax,    0, 0, 2, 1)
+        self.grid.addWidget(self.info_panel, 0, 1, 2, 1)
         self.grid.setColumnStretch(0, 3); self.grid.setColumnStretch(1, 2)
         self.grid.setRowStretch(0, 1);    self.grid.setRowStretch(1, 1)
-        self.sld_ax.setVisible(False); self.sld_co.setVisible(False); self.sld_sa.setVisible(False)
+        self.pane_ax.sld.setVisible(False)
 
     def _apply_layout_triptych(self):
-        self._ax_wrap.setVisible(True)
-        self._co_wrap.setVisible(True)
-        self._sa_wrap.setVisible(True)
+        self.pane_ax.setVisible(True)
+        self.pane_co.setVisible(True)
+        self.pane_sa.setVisible(True)
         
         self._clear_grid()
-        if self.swap_axial_coronal:
-            self.grid.addWidget(self._ax_wrap, 0, 0)
-            self.grid.addWidget(self.info_panel, 0, 1) # Use self.info_panel
-            self.grid.addWidget(self._co_wrap, 1, 0)
-        else:
-            self.grid.addWidget(self._co_wrap, 0, 0)
-            self.grid.addWidget(self.info_panel, 0, 1) # Use self.info_panel
-            self.grid.addWidget(self._ax_wrap, 1, 0)
-        self.grid.addWidget(self._sa_wrap, 1, 1)
+        # Usually: Top=Co, BottomLeft=Ax, BottomRight=Sa
+        self.grid.addWidget(self.pane_co, 0, 0)
+        self.grid.addWidget(self.info_panel, 0, 1)
+        self.grid.addWidget(self.pane_ax, 1, 0)
+        self.grid.addWidget(self.pane_sa, 1, 1)
+        
         self.grid.setColumnStretch(0, 1); self.grid.setColumnStretch(1, 1)
         self.grid.setRowStretch(0, 1);    self.grid.setRowStretch(1, 1)
-        self.sld_ax.setVisible(True); self.sld_co.setVisible(True); self.sld_sa.setVisible(True)
+        for p in (self.pane_ax, self.pane_co, self.pane_sa):
+            p.sld.setVisible(True)
         QTimer.singleShot(0, self._rescale_all)
 
     def set_mode(self, mode: str):
@@ -464,117 +555,87 @@ class CTQuadPanel(QGroupBox):
         self._dataset_type = dataset_type
         self.set_mode("triptych")
 
-        try:
-            import SimpleITK as sitk
-        except Exception:
-            return
+        try: import SimpleITK as sitk
+        except: return
 
-        # FIX: Use original sitk image if provided (preserves exact geometry for overlay alignment)
         if sitk_image is not None:
             img = sitk_image
         else:
             try:
                 img = sitk.GetImageFromArray(vol.astype(np.float32))
                 img.SetSpacing((float(spacing[2]), float(spacing[1]), float(spacing[0])))
-                if origin is not None:
-                    img.SetOrigin(tuple(float(x) for x in origin))
+                if origin is not None: img.SetOrigin(tuple(float(x) for x in origin))
                 if direction is not None:
                     d = np.array(direction, dtype=float).reshape(3, 3)
                     img.SetDirection(d.ravel(order="C").tolist())
-            except Exception:
-                return
+            except: return
 
         self._sitk_base_img = img
-        self._overlay_cache.clear()  # Clear cache when geometry changes
+        self._overlay_cache.clear()
 
-        def _compute_sar_meta(sitk_img):
-            D_lps = np.array(sitk_img.GetDirection(), dtype=float).reshape(3, 3)
-            L2R = np.diag([-1.0, -1.0, 1.0])
-            D_ras = L2R @ D_lps
-            axes = ['I', 'J', 'K']; anat = ['R', 'A', 'S']
-            idx_for = {}; sign_for = {}; used = set()
-            for t_idx, t_lbl in enumerate(anat):
-                best_axis = None; best_val = -1.0; best_sign = +1
-                for col, name in enumerate(axes):
-                    if name in used:
-                        continue
-                    v = D_ras[:, col]; val = abs(v[t_idx])
-                    if val > best_val:
-                        best_val = val; best_axis = name; best_sign = +1 if v[t_idx] >= 0 else -1
-                idx_for[t_lbl] = best_axis; sign_for[t_lbl] = best_sign; used.add(best_axis)
-            return {"idx_for_RAS": idx_for, "sign_for_RAS": sign_for}
-
-        self._sar_meta = _compute_sar_meta(img)
-
+        # We keep _vol_SAR and _spacing_SAR as our clinical reference (Superior-Anterior-Right)
+        # but we don't apply global transforms anymore.
         vol_SAR, spacing_SAR = self._reorient_image_to_SAR_numpy(img)
-        
-        # --- SPARE AXIS SWAP ---
-        if dataset_type == "spare":
-            # Swap Axial (S) and Coronal (A) per user request.
-            # This also naturally rotates the Sagittal (S,A) plane by 90 degrees.
-            vol_SAR = np.transpose(vol_SAR, (1, 0, 2))
-            spacing_SAR = (spacing_SAR[1], spacing_SAR[0], spacing_SAR[2])
-            # Update SAR reorient params so overlays follow
-            p = self._sar_reorient_params
-            p['perm_zyx_to_SAR'] = (p['perm_zyx_to_SAR'][1], p['perm_zyx_to_SAR'][0], p['perm_zyx_to_SAR'][2])
-            p['flips_SAR'] = (p['flips_SAR'][1], p['flips_SAR'][0], p['flips_SAR'][2])
-        # -----------------------
-
+        self._vol_SAR = vol_SAR
         self._spacing_SAR = spacing_SAR
-        vol_log, spacing_log = self._build_logical_from_physical(vol_SAR, spacing_SAR)
-
-        def _perm_from_SAR(shape_SAR, sp_SAR):
-            S, A, R = map(int, shape_SAR)
-            s_mm, a_mm, r_mm = map(float, sp_SAR)
-            spacing_rank = sorted([('S', s_mm), ('A', a_mm), ('R', r_mm)], key=lambda x: x[1], reverse=True)
-            size_rank    = sorted([('S', S),    ('A', A),    ('R', R)],    key=lambda x: x[1])
-            score = {'S': 0, 'A': 0, 'R': 0}
-            for i, (ax, _) in enumerate(spacing_rank): score[ax] += (2 - i)
-            for i, (ax, _) in enumerate(size_rank):    score[ax] += (2 - i)
-            through = max(['S', 'A', 'R'], key=lambda ax: score[ax])
-            if through == 'S':   return (0, 1, 2)
-            if through == 'A':   return (1, 0, 2)
-            else:                return (2, 1, 0)
-
-        self._perm_phys_to_log = _perm_from_SAR(vol_SAR.shape, spacing_SAR)
-
-        lo, hi = _robust_levels(vol_log, 0.5, 99.5)
+        
+        # In decentralized mode, we just use SAR directly as our logical volume
+        self._vol_log = vol_SAR
+        self._spacing_log = spacing_SAR
+        self._perm_phys_to_log = (0, 1, 2) # S-A-R
+        
+        # Reset and Refresh
+        lo, hi = _robust_levels(self._vol_log, 0.5, 99.5)
         self._levels = (lo, hi)
-        self._vol_log = vol_log
-        self._spacing_log = spacing_log
 
+        # Initial Smart Mapping: Try to match indices to anatomical names based on SAR metadata
         S, A, R = self._vol_log.shape
         self._cS, self._cA, self._cR = S // 2, A // 2, R // 2
-
-        self.sld_ax.setEnabled(True); self.sld_ax.setMinimum(-self._cS); self.sld_ax.setMaximum((S - 1) - self._cS)
-        self.sld_co.setEnabled(True); self.sld_co.setMinimum(-self._cA); self.sld_co.setMaximum((A - 1) - self._cA)
-        self.sld_sa.setEnabled(True); self.sld_sa.setMinimum(-self._cR); self.sld_sa.setMaximum((R - 1) - self._cR)
-
         self._iS, self._iA, self._iR = self._cS, self._cA, self._cR
+
+        # The mapping we use: Logical Volume index -> Anatomical Name
+        # Based on _build_logical_from_physical:
+        # through=='S' (S-A-R) -> (0:S, 1:A, 2:R) -> (0:Axial, 1:Coronal, 2:Sagittal)
+        # through=='A' (A-S-R) -> (0:A, 1:S, 2:R) -> (0:Coronal, 1:Axial, 2:Sagittal)
+        # through=='R' (R-A-S) -> (0:R, 1:A, 2:S) -> (0:Sagittal, 1:Coronal, 2:Axial)
+        
+        # We find which physical index is S, A, R
+        indices = {0: "Axial", 1: "Coronal", 2: "Sagittal"}
+        # But we set it based on the pane default for now, then override via signals if user changes.
+        self._axis_to_name = {0: "Axial", 1: "Coronal", 2: "Sagittal"}
+        
+        # Refresh UI
+        for p in (self.pane_ax, self.pane_co, self.pane_sa):
+            p.cmb_view.blockSignals(True)
+            p.cmb_view.setCurrentText(self._axis_to_name[p.axis_index])
+            p.cmb_view.blockSignals(False)
+
+        # Update sliders in all panes
+        self.pane_ax.sld.setEnabled(True); self.pane_ax.sld.setRange(-self._cS, (S-1)-self._cS)
+        self.pane_co.sld.setEnabled(True); self.pane_co.sld.setRange(-self._cA, (A-1)-self._cA)
+        self.pane_sa.sld.setEnabled(True); self.pane_sa.sld.setRange(-self._cR, (R-1)-self._cR)
+
         self._sync_sliders_from_state()
-        self._update_overlay_texts()
-
-        current_origin = self._sitk_base_img.GetOrigin()
-        self._overlay_tag = (
-            tuple(self._vol_log.shape), 
-            tuple(self._perm_phys_to_log), 
-            tuple(spacing_log),
-            tuple(current_origin) 
-        )
-        # --------------------------------------------
-        
-        # Clear cache only if geometry fundamentally changed? 
-        # Actually, sticking origin in the tag effectively invalidates the cache for new origins.
-        # We don't strictly need to clear _overlay_cache, but creating a new tag logic is enough.
-        
-        if self._overlay_name:
-            self._ov_log = self._ensure_overlay_loaded(self._overlay_name)
-
-        for lbl in (self.lbl_ax, self.lbl_co, self.lbl_sa):
-            lbl.set_tl_text("")
         self._update_triptych()
-        self._rescale_all()
-        QTimer.singleShot(50, self._rescale_all)
+
+    def get_effective_orientation(self):
+        """
+        Calculates transpose axes based on current manual label assignments.
+        """
+        name_to_idx = {v: k for k, v in self._axis_to_name.items()}
+        ax_idx = name_to_idx.get("Axial", 0)
+        co_idx = name_to_idx.get("Coronal", 1)
+        sa_idx = name_to_idx.get("Sagittal", 2)
+        # This mapping represents which logical index becomes Axial, Coronal, Sagittal
+        # Pipeline expects (idx_for_ax, idx_for_co, idx_for_sa)
+        t_axes = (ax_idx, co_idx, sa_idx)
+        # Rotation is still pulled from the pane labeled 'Axial'
+        rk = 0
+        for p in (self.pane_ax, self.pane_co, self.pane_sa):
+            if self._axis_to_name[p.axis_index] == "Axial":
+                rk = p.rotation_k
+                break
+        return t_axes, rk
 
     def _reorient_image_to_SAR_numpy(self, img):
         """
@@ -636,119 +697,142 @@ class CTQuadPanel(QGroupBox):
         """Returns True if a 3D volume is currently loaded and ready for triptych display."""
         return self._vol_log is not None
 
-    # ---------------- UI mechanics ----------------
     def _sync_sliders_from_state(self):
-        self.sld_ax.blockSignals(True); self.sld_co.blockSignals(True); self.sld_sa.blockSignals(True)
-        self.sld_ax.setValue(self._iS - self._cS)
-        self.sld_co.setValue(self._iA - self._cA)
-        self.sld_sa.setValue(self._iR - self._cR)
-        self.sld_ax.blockSignals(False); self.sld_co.blockSignals(False); self.sld_sa.blockSignals(False)
+        for p, i, c in ((self.pane_ax, self._iS, self._cS), (self.pane_co, self._iA, self._cA), (self.pane_sa, self._iR, self._cR)):
+            p.sld.blockSignals(True)
+            p.sld.setValue(i - c)
+            p.sld.blockSignals(False)
 
     def _on_slice_changed(self, _val: int):
         if self._vol_log is None: return
-        self._iS = self._cS + self.sld_ax.value()
-        self._iA = self._cA + self.sld_co.value()
-        self._iR = self._cR + self.sld_sa.value()
-        S,A,R = self._vol_log.shape
-        self._iS = max(0, min(S-1, self._iS))
-        self._iA = max(0, min(A-1, self._iA))
-        self._iR = max(0, min(R-1, self._iR))
-        self._update_triptych(); self._update_overlay_texts()
-        self.slices_changed.emit(self._iS, self._iA, self._iR)
+        sender = self.sender()
+        if isinstance(sender, CTPane):
+            vt = sender.view_type
+            val = sender.sld.value()
+            if vt == "Axial": self._iS = self._cS + val
+            elif vt == "Coronal": self._iA = self._cA + val
+            else: self._iR = self._cR + val
+            
+            # Sync others
+            self._sync_sliders_from_state()
+            self._update_triptych()
+            self._update_overlay_texts()
+            self.slices_changed.emit(self._iS, self._iA, self._iR)
+
+    def _on_pane_settings_changed(self):
+        if self._vol_log is None: return
+        sender = self.sender()
+        if isinstance(sender, CTPane):
+            idx = sender.axis_index
+            new_name = sender.view_type
+            old_name = self._axis_to_name[idx]
+            if new_name != old_name:
+                # Swap logic
+                other_idx = next(i for i, n in self._axis_to_name.items() if n == new_name)
+                self._axis_to_name[idx] = new_name
+                self._axis_to_name[other_idx] = old_name
+                
+                # Update all combo boxes
+                for p in (self.pane_ax, self.pane_co, self.pane_sa):
+                    p.cmb_view.blockSignals(True)
+                    p.cmb_view.setCurrentText(self._axis_to_name[p.axis_index])
+                    p.cmb_view.blockSignals(False)
+
+        # Update slider ranges based on new anatomical meanings
+        S, A, R = self._vol_log.shape
+        # We need to knows which INDEX is Axial, etc.
+        name_to_idx = {v: k for k, v in self._axis_to_name.items()}
+        cents = {"Axial": self._cS, "Coronal": self._cA, "Sagittal": self._cR}
+        dims  = {"Axial": S, "Coronal": A, "Sagittal": R}
+
+        for p in (self.pane_ax, self.pane_co, self.pane_sa):
+            # p.axis_index is fixed. What is its name now?
+            nm = self._axis_to_name[p.axis_index]
+            d, c = dims[nm], cents[nm]
+            p.sld.blockSignals(True)
+            p.sld.setRange(-c, (d-1)-c)
+            p.sld.blockSignals(False)
+
+        self._sync_sliders_from_state()
+        self._update_triptych()
 
     def _update_overlay_texts(self):
         if not self._spacing_log or self._vol_log is None: return
         s_mm, a_mm, r_mm = self._spacing_log
-        mm_ax = (self._iS - self._cS) * s_mm
-        mm_co = (self._iA - self._cA) * a_mm
-        mm_sa = (self._iR - self._cR) * r_mm
-        if self._mode == "triptych":
-            if self.swap_axial_coronal:
-                self.lbl_ax.set_br_text(f"{mm_ax:.1f} mm"); self.lbl_co.set_br_text(f"{mm_co:.1f} mm")
-            else:
-                self.lbl_co.set_br_text(f"{mm_co:.1f} mm"); self.lbl_ax.set_br_text(f"{mm_ax:.1f} mm")
-            self.lbl_sa.set_br_text(f"{mm_sa:.1f} mm")
-        else:
-            self.lbl_ax.set_br_text(f"{mm_ax:.1f} mm")
+        mm_map = {"Axial": s_mm, "Coronal": a_mm, "Sagittal": r_mm}
+        idx_map = {"Axial": (self._iS, self._cS), "Coronal": (self._iA, self._cA), "Sagittal": (self._iR, self._cR)}
+        
+        for p in (self.pane_ax, self.pane_co, self.pane_sa):
+            name = self._axis_to_name[p.axis_index]
+            cur_i, cent_i = idx_map[name]
+            spacing = mm_map[name]
+            p.lbl.set_br_text(f"{(cur_i - cent_i) * spacing:.1f} mm")
 
     def _update_triptych(self):
-        if self._vol_log is None or self._levels is None:
-            return
-
-        iS, iA, iR = self._iS, self._iA, self._iR
+        if self._vol_log is None or self._levels is None: return
         lo, hi = self._levels
-
-        # CT slices
-        try:
-            ax = np.flipud(np.fliplr(self._vol_log[iS, :, :]))
-            co = np.flipud(np.fliplr(self._vol_log[:, iA, :]))
-            sa = np.flipud(np.fliplr(self._vol_log[:, :, iR]))
-        except IndexError:
-             return 
-        
-        # Check flips from InfoWidget
-        if isinstance(self.info_panel, CTInfoWidget):
-            if self.info_panel.chk_flip_ax.isChecked(): ax = np.flipud(ax)
-            if self.info_panel.chk_flip_cor.isChecked(): co = np.flipud(co)
-            if self.info_panel.chk_flip_sag.isChecked(): sa = np.flipud(sa)
-
-        # Overlay masks
-        vol_mask = None
-        if getattr(self, "_ov_log", None) is not None:
-            vol_mask = self._ov_log
-
-        ax_mask = co_mask = sa_mask = None
-        if isinstance(vol_mask, np.ndarray) and vol_mask.ndim == 3 and vol_mask.shape == self._vol_log.shape:
-            try:
-                ax_mask = np.flipud(np.fliplr(vol_mask[iS, :, :]))
-                co_mask = np.flipud(np.fliplr(vol_mask[:, iA, :]))
-                
-                # ### FIX 2: ADD FLIPLR TO SAGITTAL MASK ###
-                # Previous: sa_mask = np.flipud(vol_mask[:, :, iR])
-                sa_mask = np.flipud(np.fliplr(vol_mask[:, :, iR]))
-            except IndexError:
-                 return
-
-            if isinstance(self.info_panel, CTInfoWidget):
-                if self.info_panel.chk_flip_ax.isChecked(): ax_mask = np.flipud(ax_mask)
-                if self.info_panel.chk_flip_cor.isChecked(): co_mask = np.flipud(co_mask)
-                if self.info_panel.chk_flip_sag.isChecked(): sa_mask = np.flipud(sa_mask)
-
-        # Window to u8
-        ax_u8 = _window_to_u8_levels(ax, lo, hi)
-        co_u8 = _window_to_u8_levels(co, lo, hi)
-        sa_u8 = _window_to_u8_levels(sa, lo, hi)
-
         overlay_color = OVERLAY_COLORS.get(self._overlay_name, (255, 200, 0))
 
-        def _blend_color(u8_slice: np.ndarray, mask2d: np.ndarray | None, color: tuple, alpha: float = 0.5) -> np.ndarray:
-            rgb = np.repeat(u8_slice[..., None], 3, axis=2).astype(np.float32)
-            if mask2d is not None and mask2d.shape == u8_slice.shape:
-                m = mask2d.astype(bool)
+        def _get_slice_tuple(pane):
+            idx = pane.axis_index
+            name = self._axis_to_name[idx]
+            # Use the index that matches the assigned anatomical name
+            slice_num = self._iS if name == "Axial" else (self._iA if name == "Coronal" else self._iR)
+            
+            if idx == 0: return self._vol_log[slice_num, :, :], (self._ov_log[slice_num, :, :] if self._ov_log is not None else None)
+            if idx == 1: return self._vol_log[:, slice_num, :], (self._ov_log[:, slice_num, :] if self._ov_log is not None else None)
+            return self._vol_log[:, :, slice_num], (self._ov_log[:, :, slice_num] if self._ov_log is not None else None)
+
+        def _blend(u8, mask, color, alpha=0.5):
+            rgb = np.repeat(u8[..., None], 3, axis=2).astype(np.float32)
+            if mask is not None and mask.shape == u8.shape:
+                m = mask.astype(bool)
                 for ch, val in enumerate(color):
                     rgb[..., ch][m] = (1.0 - alpha) * rgb[..., ch][m] + alpha * val
             return np.clip(rgb, 0, 255).astype(np.uint8)
 
-        ax_rgb = _blend_color(ax_u8, ax_mask, overlay_color)
-        co_rgb = _blend_color(co_u8, co_mask, overlay_color)
-        sa_rgb = _blend_color(sa_u8, sa_mask, overlay_color)
+        for pane in (self.pane_ax, self.pane_co, self.pane_sa):
+            slc, msk = _get_slice_tuple(pane)
+            # Normalization
+            img = np.flipud(np.fliplr(slc))
+            if msk is not None: msk = np.flipud(np.fliplr(msk))
+            
+            # Local transforms
+            if pane.rotation_k != 0:
+                img = np.rot90(img, k=pane.rotation_k)
+                if msk is not None: msk = np.rot90(msk, k=pane.rotation_k)
+            if pane.flip_h:
+                img = np.fliplr(img)
+                if msk is not None: msk = np.fliplr(msk)
+            if pane.flip_v:
+                img = np.flipud(img)
+                if msk is not None: msk = np.flipud(msk)
 
-        self._pm_ax = _to_qpixmap_rgb(ax_rgb)
-        self._pm_co = _to_qpixmap_rgb(co_rgb)
-        self._pm_sa = _to_qpixmap_rgb(sa_rgb)
+            u8 = _window_to_u8_levels(img, lo, hi)
+            rgb = _blend(u8, msk, overlay_color)
+            pane.lbl.setPixmap(_to_qpixmap_rgb(rgb))
 
         self._rescale_all()
 
-    def _scales_from_spacing(self):
-        if not self._spacing_log:
-            return (1.0, 1.0), (1.0, 1.0), (1.0, 1.0)
-        s_mm, a_mm, r_mm = self._spacing_log
-        ax = (r_mm, a_mm)
-        co = (r_mm, s_mm)
-        sa = (a_mm, s_mm)
-        def _norm(fx, fy):
-            m = max(fx, fy, 1e-6); return (fx/m, fy/m)
-        return _norm(*ax), _norm(*co), _norm(*sa)
+    def _get_scale_for_view_by_index(self, axis_idx: int):
+        if not self._spacing_log: return (1.0, 1.0)
+        s, a, r = self._spacing_log
+        # Slicing axis 0 (S) -> show A and R dimensions. Width=R, Height=A
+        if axis_idx == 0:   fx, fy = r, a
+        # Slicing axis 1 (A) -> show S and R dimensions. Width=R, Height=S
+        elif axis_idx == 1: fx, fy = r, s
+        # Slicing axis 2 (R) -> show S and A dimensions. Width=A, Height=S
+        else:               fx, fy = a, s
+        m = max(fx, fy, 1e-6)
+        return fx/m, fy/m
+
+    def _rescale_all(self):
+        if self._mode == "single":
+            self._set_scaled_fit(self.pane_ax.lbl, self.pane_ax.lbl.pixmap(), 1.0, 1.0)
+            return
+        for p in (self.pane_ax, self.pane_co, self.pane_sa):
+            sc = self._get_scale_for_view_by_index(p.axis_index)
+            self._set_scaled_fit(p.lbl, p.lbl.pixmap(), *sc)
 
     def _set_scaled_fit(self, lbl: QLabel, pm: QPixmap | None, fx: float = 1.0, fy: float = 1.0):
         if not pm or pm.isNull(): return
@@ -760,22 +844,6 @@ class CTQuadPanel(QGroupBox):
         tw = max(1, int(pw * fx * s)); th = max(1, int(ph * fy * s))
         lbl.setPixmap(pm.scaled(tw, th, Qt.AspectRatioMode.IgnoreAspectRatio,
                                 Qt.TransformationMode.SmoothTransformation))
-
-    def _rescale_all(self):
-        if self._mode == "single":
-            if self._pm_ax and not self._pm_ax.isNull():
-                self._set_scaled_fit(self.lbl_ax, self._pm_ax, 1.0, 1.0)
-            return
-        ax_sc, co_sc, sa_sc = self._scales_from_spacing()
-        if self.swap_axial_coronal:
-            tl_pm, tl_sc, tl_lbl = self._pm_ax, ax_sc, self.lbl_ax
-            bl_pm, bl_sc, bl_lbl = self._pm_co, co_sc, self.lbl_co
-        else:
-            tl_pm, tl_sc, tl_lbl = self._pm_co, co_sc, self.lbl_co
-            bl_pm, bl_sc, bl_lbl = self._pm_ax, ax_sc, self.lbl_ax
-        if tl_pm and not tl_pm.isNull(): self._set_scaled_fit(tl_lbl, tl_pm, *tl_sc)
-        if bl_pm and not bl_pm.isNull(): self._set_scaled_fit(bl_lbl, bl_pm, *bl_sc)
-        if self._pm_sa and not self._pm_sa.isNull(): self._set_scaled_fit(self.lbl_sa, self._pm_sa, *sa_sc)
 
     # Legacy DICOM previews
     def set_axial_pixmap(self, pix_ax: QPixmap | None):
@@ -1428,9 +1496,9 @@ class DVFPanel(CTQuadPanel):
             S, A, R = self._vol_log.shape
         
         self._cS, self._cA, self._cR = S//2, A//2, R//2
-        self.sld_ax.setEnabled(True); self.sld_ax.setMinimum(-self._cS); self.sld_ax.setMaximum((S-1)-self._cS)
-        self.sld_co.setEnabled(True); self.sld_co.setMinimum(-self._cA); self.sld_co.setMaximum((A-1)-self._cA)
-        self.sld_sa.setEnabled(True); self.sld_sa.setMinimum(-self._cR); self.sld_sa.setMaximum((R-1)-self._cR)
+        self.pane_ax.sld.setEnabled(True); self.pane_ax.sld.setMinimum(-self._cS); self.pane_ax.sld.setMaximum((S-1)-self._cS)
+        self.pane_co.sld.setEnabled(True); self.pane_co.sld.setMinimum(-self._cA); self.pane_co.sld.setMaximum((A-1)-self._cA)
+        self.pane_sa.sld.setEnabled(True); self.pane_sa.sld.setMinimum(-self._cR); self.pane_sa.sld.setMaximum((R-1)-self._cR)
         
         # Clamp indices
         self._iS = max(0, min(S-1, self._iS))
@@ -1636,49 +1704,43 @@ class DVFPanel(CTQuadPanel):
         iS, iA, iR = self._iS, self._iA, self._iR
         lo, hi = self._levels
 
-        # CT slices (Parent logic for extraction)
-        try:
-            ax = np.flipud(np.fliplr(self._vol_log[iS, :, :]))
-            co = np.flipud(np.fliplr(self._vol_log[:, iA, :]))
-            sa = np.flipud(np.fliplr(self._vol_log[:, :, iR]))
-        except IndexError:
-             return 
+        # Build per-pane slices using axis_index (same as parent CT viewer)
+        view_tags = {0: "ax", 1: "co", 2: "sa"}  # for arrow helpers
+        pane_list = [self.pane_ax, self.pane_co, self.pane_sa]
+        pane_rgbs = {}  # axis_index -> rgb float array
 
-        # Apply Flip Toggles from InfoWidget (Accessing via self.dvf_info is safer due to inheritance)
-        # Since DVFPanel uses DVFInfoWidget which inherits BaseInfoWidget but DOES NOT have flip toggles?
-        # WAIT: DVFInfoWidget does not have flip toggles in the code I provided earlier. 
-        # If you want flip toggles in DVF view, DVFInfoWidget should probably include them or inherit from CTInfoWidget.
-        # Assuming we use standard flip logic from CTQuadPanel attributes if available, OR simply ignore flips if widgets don't exist.
-        
-        # CHECK: CTQuadPanel defines chk_flip_* in __init__ if standard. 
-        # But in refactor, they moved to InfoWidget.
-        # If DVFInfoWidget doesn't have them, we can't flip.
-        # Let's assume for now DVF view doesn't require manual flips, or they default to False.
-        
-        # Window to u8
-        ax_rgb = np.repeat(_window_to_u8_levels(ax, lo, hi)[..., None], 3, axis=2).astype(np.float32)
-        co_rgb = np.repeat(_window_to_u8_levels(co, lo, hi)[..., None], 3, axis=2).astype(np.float32)
-        sa_rgb = np.repeat(_window_to_u8_levels(sa, lo, hi)[..., None], 3, axis=2).astype(np.float32)
+        for pane in pane_list:
+            idx = pane.axis_index
+            name = self._axis_to_name[idx]
+            slice_num = self._iS if name == "Axial" else (self._iA if name == "Coronal" else self._iR)
+
+            try:
+                if idx == 0:   slc = self._vol_log[slice_num, :, :]
+                elif idx == 1: slc = self._vol_log[:, slice_num, :]
+                else:          slc = self._vol_log[:, :, slice_num]
+            except IndexError:
+                continue
+
+            img = np.flipud(np.fliplr(slc))
+
+            # Apply pane-local transforms
+            if pane.rotation_k != 0:
+                img = np.rot90(img, k=pane.rotation_k)
+            if pane.flip_h:
+                img = np.fliplr(img)
+            if pane.flip_v:
+                img = np.flipud(img)
+
+            rgb = np.repeat(_window_to_u8_levels(img, lo, hi)[..., None], 3, axis=2).astype(np.float32)
+            pane_rgbs[idx] = rgb
 
         # Overlay DVF magnitude
         if self._dvf_log is not None and self._dvf_log.shape == self._vol_log.shape:
             vmax = float(self._dvf_vmax)
             alpha = float(self._dvf_alpha)
 
-            try:
-                dvf_ax = np.flipud(np.fliplr(self._dvf_log[iS, :, :]))
-                dvf_co = np.flipud(np.fliplr(self._dvf_log[:, iA, :]))
-                dvf_sa = np.flipud(np.fliplr(self._dvf_log[:, :, iR]))
-            except IndexError:
-                 return
-
-            # Stats update
-            try:
-                self.dvf_info.lbl_dvf_stats.setText(
-                    f"min {float(np.nanmin(dvf_ax)):.2f}  |  max {float(np.nanmax(dvf_ax)):.2f}  |  mean {float(np.nanmean(dvf_ax)):.2f} mm"
-                )
-            except Exception:
-                self.dvf_info.lbl_dvf_stats.setText("—")
+            # Stats from first pane (axial-labeled)
+            first_stats_done = False
 
             def blend(rgb, dvf):
                 norm = np.clip(dvf / max(vmax, 1e-6), 0.0, 1.0)
@@ -1686,10 +1748,42 @@ class DVFPanel(CTQuadPanel):
                 mask = dvf > 0.0
                 rgb[mask] = (1.0 - alpha) * rgb[mask] + alpha * colors[mask]
 
-            for rgb, dvf in ((ax_rgb, dvf_ax), (co_rgb, dvf_co), (sa_rgb, dvf_sa)):
-                if dvf is not None and dvf.shape == rgb.shape[:2]:
-                    blend(rgb, dvf)
+            for pane in pane_list:
+                idx = pane.axis_index
+                if idx not in pane_rgbs:
+                    continue
+                name = self._axis_to_name[idx]
+                slice_num = self._iS if name == "Axial" else (self._iA if name == "Coronal" else self._iR)
 
+                try:
+                    if idx == 0:   dvf_slc = self._dvf_log[slice_num, :, :]
+                    elif idx == 1: dvf_slc = self._dvf_log[:, slice_num, :]
+                    else:          dvf_slc = self._dvf_log[:, :, slice_num]
+                except IndexError:
+                    continue
+
+                dvf_slc = np.flipud(np.fliplr(dvf_slc))
+                if pane.rotation_k != 0:
+                    dvf_slc = np.rot90(dvf_slc, k=pane.rotation_k)
+                if pane.flip_h:
+                    dvf_slc = np.fliplr(dvf_slc)
+                if pane.flip_v:
+                    dvf_slc = np.flipud(dvf_slc)
+
+                rgb = pane_rgbs[idx]
+                if dvf_slc.shape == rgb.shape[:2]:
+                    blend(rgb, dvf_slc)
+
+                if not first_stats_done:
+                    try:
+                        self.dvf_info.lbl_dvf_stats.setText(
+                            f"min {float(np.nanmin(dvf_slc)):.2f}  |  max {float(np.nanmax(dvf_slc)):.2f}  |  mean {float(np.nanmean(dvf_slc)):.2f} mm"
+                        )
+                    except Exception:
+                        self.dvf_info.lbl_dvf_stats.setText("—")
+                    first_stats_done = True
+
+            # Arrows
             if (
                 self.dvf_info.arrows_enabled()
                 and self._dvf_vec_log is not None
@@ -1699,72 +1793,66 @@ class DVFPanel(CTQuadPanel):
             ):
                 perm = self._perm_phys_to_log
                 sp = self._spacing_log
-                try:
-                    ua, va = _dvf_inplane_mm(self._dvf_vec_log, perm, iS, iA, iR, "ax")
-                    ua = np.flipud(np.fliplr(ua))
-                    va = np.flipud(np.fliplr(va))
-                    _overlay_arrows_on_rgb(
-                        ax_rgb,
-                        ua,
-                        va,
-                        sp[1],
-                        sp[2],
-                        step=self.dvf_info.spn_arrow_step.value(),
-                        length_scale=float(self.dvf_info.dbl_arrow_length.value()),
-                        max_arrows=int(self.dvf_info.spn_arrow_max.value()),
-                        min_mag_mm=float(self.dvf_info.dbl_arrow_min_mag.value()),
-                    )
-                    uc, vc = _dvf_inplane_mm(self._dvf_vec_log, perm, iS, iA, iR, "co")
-                    uc = np.flipud(np.fliplr(uc))
-                    vc = np.flipud(np.fliplr(vc))
-                    _overlay_arrows_on_rgb(
-                        co_rgb,
-                        uc,
-                        vc,
-                        sp[0],
-                        sp[2],
-                        step=self.dvf_info.spn_arrow_step.value(),
-                        length_scale=float(self.dvf_info.dbl_arrow_length.value()),
-                        max_arrows=int(self.dvf_info.spn_arrow_max.value()),
-                        min_mag_mm=float(self.dvf_info.dbl_arrow_min_mag.value()),
-                    )
-                    us, vs = _dvf_inplane_mm(self._dvf_vec_log, perm, iS, iA, iR, "sa")
-                    us = np.flipud(np.fliplr(us))
-                    vs = np.flipud(np.fliplr(vs))
-                    _overlay_arrows_on_rgb(
-                        sa_rgb,
-                        us,
-                        vs,
-                        sp[0],
-                        sp[1],
-                        step=self.dvf_info.spn_arrow_step.value(),
-                        length_scale=float(self.dvf_info.dbl_arrow_length.value()),
-                        max_arrows=int(self.dvf_info.spn_arrow_max.value()),
-                        min_mag_mm=float(self.dvf_info.dbl_arrow_min_mag.value()),
-                    )
-                except Exception:
-                    pass
-        else:
-             self.dvf_info.lbl_dvf_stats.setText("—")
+                arrow_kwargs = dict(
+                    step=self.dvf_info.spn_arrow_step.value(),
+                    length_scale=float(self.dvf_info.dbl_arrow_length.value()),
+                    max_arrows=int(self.dvf_info.spn_arrow_max.value()),
+                    min_mag_mm=float(self.dvf_info.dbl_arrow_min_mag.value()),
+                )
+                # Spacing pairs per axis index
+                sp_pairs = {0: (sp[1], sp[2]), 1: (sp[0], sp[2]), 2: (sp[0], sp[1])}
 
-        self._pm_ax = _to_qpixmap_rgb(np.clip(ax_rgb, 0, 255).astype(np.uint8))
-        self._pm_co = _to_qpixmap_rgb(np.clip(co_rgb, 0, 255).astype(np.uint8))
-        self._pm_sa = _to_qpixmap_rgb(np.clip(sa_rgb, 0, 255).astype(np.uint8))
+                for pane in pane_list:
+                    idx = pane.axis_index
+                    if idx not in pane_rgbs:
+                        continue
+                    tag = view_tags[idx]
+                    try:
+                        u_arr, v_arr = _dvf_inplane_mm(self._dvf_vec_log, perm, iS, iA, iR, tag)
+                        u_arr = np.flipud(np.fliplr(u_arr))
+                        v_arr = np.flipud(np.fliplr(v_arr))
+                        if pane.rotation_k != 0:
+                            u_arr = np.rot90(u_arr, k=pane.rotation_k)
+                            v_arr = np.rot90(v_arr, k=pane.rotation_k)
+                        if pane.flip_h:
+                            u_arr = np.fliplr(u_arr)
+                            v_arr = np.fliplr(v_arr)
+                        if pane.flip_v:
+                            u_arr = np.flipud(u_arr)
+                            v_arr = np.flipud(v_arr)
+                        row_sp, col_sp = sp_pairs[idx]
+                        _overlay_arrows_on_rgb(
+                            pane_rgbs[idx], u_arr, v_arr,
+                            row_sp, col_sp, **arrow_kwargs,
+                        )
+                    except Exception:
+                        pass
+        else:
+            self.dvf_info.lbl_dvf_stats.setText("—")
+
+        # Set pixmaps directly on pane labels (critical fix)
+        for pane in pane_list:
+            idx = pane.axis_index
+            if idx in pane_rgbs:
+                pane.lbl.setPixmap(_to_qpixmap_rgb(np.clip(pane_rgbs[idx], 0, 255).astype(np.uint8)))
 
         self._rescale_all()
         try: self._update_overlay_texts()
         except: pass
 
     def eventFilter(self, obj: QObject, event: QEvent) -> bool:
-        if event.type() == QEvent.Type.MouseMove and obj in (self.lbl_ax, self.lbl_co, self.lbl_sa):
-            self._update_hover_value(obj, event)
+        if event.type() == QEvent.Type.MouseMove:
+            for pane in (self.pane_ax, self.pane_co, self.pane_sa):
+                if obj is pane.lbl:
+                    self._update_hover_value(pane, event)
+                    break
         return super().eventFilter(obj, event)
 
-    def _update_hover_value(self, lbl: QLabel, e):
+    def _update_hover_value(self, pane, e):
         if self._dvf_log is None or self._vol_log is None or self._dvf_log.shape != self._vol_log.shape: 
             return
             
-        pm = lbl.pixmap()
+        pm = pane.lbl.pixmap()
         if not pm or pm.isNull(): return
         w_disp, h_disp = pm.width(), pm.height()
         if w_disp <= 0 or h_disp <= 0: return
@@ -1773,10 +1861,11 @@ class DVFPanel(CTQuadPanel):
         iS, iA, iR = self._iS, self._iA, self._iR
         
         try:
-            if lbl is self.lbl_ax:
+            idx = pane.axis_index
+            if idx == 0:
                 H, W = self._vol_log.shape[1], self._vol_log.shape[2]
                 dvf = np.flipud(np.fliplr(self._dvf_log[iS, :, :]))
-            elif lbl is self.lbl_co:
+            elif idx == 1:
                 H, W = self._vol_log.shape[0], self._vol_log.shape[2]
                 dvf = np.flipud(np.fliplr(self._dvf_log[:, iA, :]))
             else:
@@ -1787,8 +1876,9 @@ class DVFPanel(CTQuadPanel):
             ix = max(0, min(W-1, ix)); iy = max(0, min(H-1, iy))
 
             val = float(dvf[iy, ix])
-            self.lbl_ax.set_tl_text(""); self.lbl_co.set_tl_text(""); self.lbl_sa.set_tl_text("")
-            lbl.set_tl_text(f"|DVF|={val:.2f} mm")
+            for p in (self.pane_ax, self.pane_co, self.pane_sa):
+                p.lbl.set_tl_text("")
+            pane.lbl.set_tl_text(f"|DVF|={val:.2f} mm")
         except Exception:
             pass
 

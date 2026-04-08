@@ -52,7 +52,6 @@ class CTInfoWidget(BaseInfoWidget):
     """
     phase_changed = pyqtSignal(int, str)    # index, text
     overlay_changed = pyqtSignal(str)       # overlay_name (or None)
-    flip_changed = pyqtSignal()             # Emitted when any flip toggle changes
     dicom_preview_series_uid_changed = pyqtSignal(str)  # "" = auto (largest), else SeriesInstanceUID
 
     def __init__(self):
@@ -87,21 +86,6 @@ class CTInfoWidget(BaseInfoWidget):
         self.layout.addRow("Voxel (z,y,x):", self.lbl_vox)
         self.layout.addRow("#Slices:", self.lbl_count)
 
-        # --- 4. Flip Toggles ---
-        self.flip_container = QWidget()
-        flip_lay = QHBoxLayout(self.flip_container)
-        flip_lay.setContentsMargins(0, 5, 0, 0)
-
-        self.chk_flip_cor = QCheckBox("Coronal Flip")
-        self.chk_flip_ax = QCheckBox("Axial Flip")
-        self.chk_flip_sag = QCheckBox("Sagittal Flip")
-        flip_lay.addWidget(self.chk_flip_cor)
-        flip_lay.addWidget(self.chk_flip_ax)
-        flip_lay.addWidget(self.chk_flip_sag)
-        self.chk_flip_cor.stateChanged.connect(lambda *_: self.flip_changed.emit())
-        self.chk_flip_ax.stateChanged.connect(lambda *_: self.flip_changed.emit())
-        self.chk_flip_sag.stateChanged.connect(lambda *_: self.flip_changed.emit())
-        self.layout.addRow("Flip:", self.flip_container)
 
     def _on_preview_series_pick(self, idx: int) -> None:
         if idx < 0:
@@ -142,14 +126,13 @@ class CTInfoWidget(BaseInfoWidget):
 
     def set_preview_mode(self, is_preview: bool):
         """
-        If True (Step 1): Hides Phase, Overlay, and Flip controls.
+        If True (Step 1): Hides Phase, Overlay, Orientation/Rotation, and Flip controls.
         If False (Step 2+): Shows all controls.
         """
         self._in_preview_mode = is_preview
         multi = self.cmb_preview_series.count() > 1
         self.layout.setRowVisible(self.cmb_phase, not is_preview)
         self.layout.setRowVisible(self.cmb_overlay, not is_preview)
-        self.layout.setRowVisible(self.flip_container, not is_preview)
         self._lbl_preview_series.setVisible(is_preview and multi)
         self.cmb_preview_series.setVisible(is_preview and multi)
 

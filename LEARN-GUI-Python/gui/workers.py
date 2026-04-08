@@ -172,10 +172,19 @@ class CopyWorker(BasePythonWorker):
 
 
 class Dicom2MhaWorker(BasePythonWorker):
-    def __init__(self, train_dir: Path, dataset_type: str = "clinical", parent=None):
+    def __init__(
+        self,
+        train_dir: Path,
+        dataset_type: str = "clinical",
+        transpose_axes: Optional[Tuple[int, int, int]] = None,
+        rotate_k: int = 0,
+        parent=None,
+    ):
         super().__init__(parent)
         self.train_dir = Path(train_dir)
         self.dataset_type = dataset_type
+        self.transpose_axes = transpose_axes
+        self.rotate_k = rotate_k
 
     def run(self):
         try:
@@ -189,9 +198,13 @@ class Dicom2MhaWorker(BasePythonWorker):
                 self.log(f"DICOM2MHA: {filename} done ({done}/{total})")
 
             run_dicom2mha(
-                self.train_dir, self.train_dir,
+                self.train_dir,
+                self.train_dir,
                 dataset_type=self.dataset_type,
-                on_phase_done=on_phase_done, on_status=on_status
+                on_phase_done=on_phase_done,
+                on_status=on_status,
+                transpose_axes=self.transpose_axes,
+                rotate_k=self.rotate_k,
             )
             self.log("DICOM2MHA: Complete")
             self.finished_ok.emit("DICOM2MHA")
@@ -387,6 +400,8 @@ class PythonPipelineJob(QThread):
                   skip_kv_preprocess: bool, base_dir: str, patient_id: str,
                   drr_generation_options: dict | None = None,
                   dataset_type: str = "clinical",
+                  transpose_axes: Optional[Tuple[int, int, int]] = None,
+                  rotate_k: int = 0,
                   parent=None):
         super().__init__(parent)
         self.rt_list = rt_list
@@ -405,6 +420,8 @@ class PythonPipelineJob(QThread):
         self.do_3d_full = do_3d_full
         self.skip_kv_preprocess = skip_kv_preprocess
         self.drr_generation_options = drr_generation_options or {}
+        self.transpose_axes = transpose_axes
+        self.rotate_k = rotate_k
         self._cancelled = False
         self._worker_failed = False
 
@@ -580,6 +597,8 @@ class PythonPipelineJob(QThread):
             dataset_type=self.dataset_type,
             on_phase_done=lambda done, total, fn: self._log(f"DICOM2MHA: {fn} done ({done}/{total})"),
             on_status=lambda msg: self._log(f"DICOM2MHA: {msg}"),
+            transpose_axes=self.transpose_axes,
+            rotate_k=self.rotate_k,
         )
         self._log("DICOM2MHA: Complete")
 

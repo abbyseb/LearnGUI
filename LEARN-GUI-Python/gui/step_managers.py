@@ -584,12 +584,26 @@ class DICOM2MHAStepManager(WorkerBackedStepManager):
 
     progress_detail = pyqtSignal(int, int, int, int)  # ct_done, ct_total, struct_done, struct_total
 
-    def __init__(self, dataset_type: str = "clinical", parent=None):
+    def __init__(
+        self,
+        dataset_type: str = "clinical",
+        transpose_axes: Optional[tuple[int, int, int]] = None,
+        rotate_k: int = 0,
+        parent=None,
+    ):
         super().__init__(dataset_type=dataset_type, parent=parent)
+        self.transpose_axes = transpose_axes
+        self.rotate_k = rotate_k
 
     def _create_worker(self):
         from .workers import Dicom2MhaWorker
-        return Dicom2MhaWorker(self.train_dir, dataset_type=self.dataset_type, parent=self)
+        return Dicom2MhaWorker(
+            self.train_dir,
+            dataset_type=self.dataset_type,
+            transpose_axes=self.transpose_axes,
+            rotate_k=self.rotate_k,
+            parent=self,
+        )
 
     def get_viewer_type(self) -> Optional[str]:
         return 'ct'

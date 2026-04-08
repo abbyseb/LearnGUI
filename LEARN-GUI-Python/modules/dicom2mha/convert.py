@@ -136,6 +136,8 @@ def convert_dicom_to_mha(
     *,
     on_status: Optional[Callable[[str], None]] = None,
     on_phase_done: Optional[Callable[[int, int, str], None]] = None,
+    transpose_axes: Optional[Tuple[int, int, int]] = None,
+    rotate_k: int = 0,
 ):
     """
     MATLAB-equivalent conversion (pydicom + numpy; no ITK ImageSeriesReader).
@@ -181,6 +183,14 @@ def convert_dicom_to_mha(
         for j, (nbin, vol, pix, line) in enumerate(valkim_volumes, start=1):
             name = f"CT_{nbin:02d}.mha"
             target = output_dir / name
+
+            # Apply manual rebind/transpose if requested
+            if transpose_axes is not None and list(transpose_axes) != [0, 1, 2]:
+                vol = np.transpose(vol, transpose_axes)
+                pix = pix[list(transpose_axes)]
+            if rotate_k != 0:
+                vol = np.rot90(vol, k=rotate_k, axes=(1, 2))
+
             _status(f"  Writing {name} (phase bin {nbin}, shape {vol.shape})...")
             try:
                 write_mha_float32(vol, pix, target)
@@ -202,7 +212,9 @@ def convert_dicom_to_mha(
             target = output_dir / name
             _status(f"  Series {j}/{n_out} ({len(files)} files) -> {name}...")
             try:
-                vol, pix = dicom2iec_volume(files)
+                vol, pix = dicom2iec_volume(
+                    files, transpose_axes=transpose_axes, rotate_k=rotate_k
+                )
                 apply_water_attenuation(vol, water_att)
                 write_mha_float32(vol, pix, target)
                 generated_files.append(str(target))

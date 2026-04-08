@@ -384,7 +384,14 @@ class MainController(QObject):
             q.append(("COPY", copy_extra))
         
         if not skip_dicom2mha:
-            q.append(("DICOM2MHA", {"dataset_type": dataset_type}))
+            # New decentralised logic: query the viewer for pane-local orientation/rotation
+            t_axes, rk = self.win.tab2d.ct_quad.get_effective_orientation()
+            
+            q.append(("DICOM2MHA", {
+                "dataset_type": dataset_type,
+                "transpose_axes": t_axes,
+                "rotate_k": rk
+            }))
         
         if not skip_downsample:
             q.append(("DOWNSAMPLE", {"dataset_type": dataset_type}))
@@ -973,6 +980,12 @@ class MainController(QObject):
             drr_opts = self.win.tab2d.get_drr_generation_options()
             step_kwargs["geom_path"] = drr_opts.get("geometry_path")
             step_kwargs["drr_opts"] = drr_opts
+
+        elif step.upper() == "DICOM2MHA":
+            # Rerun single step: gather orientation from the active viewer
+            t_axes, rk = self.win.tab2d.ct_quad.get_effective_orientation()
+            step_kwargs["transpose_axes"] = t_axes
+            step_kwargs["rotate_k"] = rk
 
         
         self._activate_step(step.upper(), **step_kwargs)

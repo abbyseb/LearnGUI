@@ -43,7 +43,11 @@ def _hu_slice(ds) -> np.ndarray:
     return arr * slope + intercept
 
 
-def dicom2iec_volume(file_paths: List[Path]) -> Tuple[np.ndarray, np.ndarray]:
+def dicom2iec_volume(
+    file_paths: List[Path],
+    transpose_axes: Optional[Tuple[int, int, int]] = None,
+    rotate_k: int = 0,
+) -> Tuple[np.ndarray, np.ndarray]:
     """
     Port of DICOM2IEC.m (excluding water attenuation and MhaWrite).
 
@@ -101,6 +105,17 @@ def dicom2iec_volume(file_paths: List[Path]) -> Tuple[np.ndarray, np.ndarray]:
         st = float(ps[0])
     st = float(st)
     pix = np.array([float(ps[0]), st, float(ps[1])], dtype=np.float64)
+
+    # Apply rebind/transpose if requested
+    if transpose_axes is not None and list(transpose_axes) != [0, 1, 2]:
+        M = np.transpose(M, transpose_axes)
+        pix = pix[list(transpose_axes)]
+
+    # Apply rotation if requested (rotation in the "in-plane" axes)
+    # By default, M is (S, A, R). In-plane is (A, R), which are indices 1 and 2.
+    if rotate_k != 0:
+        M = np.rot90(M, k=rotate_k, axes=(1, 2))
+
     return M, pix
 
 
